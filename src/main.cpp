@@ -68,6 +68,7 @@
 #define PRINT_PERIOD    200   // USB 5 Hz
 #define RF_PERIOD       66    // RF 15 Hz
 #define FLIGHT_PERIOD   10    // 100 Hz ucush nezareti (yalniz CC)
+#define I2C_DIAG_PERIOD 5000  // 5 s I2C diaqnostika
 
 // ======================== BNO055 REGISTERLERI ========================
 #define BNO055_CHIP_ID      0x00
@@ -79,9 +80,6 @@
 #define BNO055_ACC_START    0x08
 #define BNO055_MAG_START    0x0E
 #define BNO055_GYRO_START   0x14
-#define BNO055_PAGE_ID      0x07
-#define BNO055_ACC_CFG      0x08   // page 1: akseleorometr konfigurasiyasi
-#define BNO055_GYR_CFG0     0x0A   // page 1: giroskop konfigurasiyasi
 
 // ======================== BME280 REGISTER ========================
 #define BME280_CHIP_ID      0xD0
@@ -145,7 +143,7 @@ static struct{uint8_t bno055:1,bme280:1,aht20:1,gps_fix:1;} ok;
 static AttitudeEKF ekf;
 static Kalman1D kalmanTemp,kalmanAlt;
 static bool kalman_ready=false,aht_triggered=false;
-static uint32_t aht_trigger_ms=0,lastBno,lastBme,lastAht,lastGps,lastPrn,lastRf;
+static uint32_t aht_trigger_ms=0,lastBno,lastBme,lastAht,lastGps,lastPrn,lastRf,lastI2cDiag;
 #if DEVICE_TYPE == 3
 static uint32_t lastFlight;
 static AltVel altvel;
@@ -238,16 +236,11 @@ static void aht20_read_finish(float&t,float&h){if(!aht_triggered)return;if(milli
 // ======================== BNO055 ========================
 static bool bno055_init(){
     if(r8(BNO055_ADDR,BNO055_CHIP_ID)!=0xA0)return false;
-    w8(BNO055_ADDR,BNO055_OPR_MODE,0x00);delay(30);
-    w8(BNO055_ADDR,BNO055_PWR_MODE,0x00);delay(10);
-    w8(BNO055_ADDR,BNO055_UNIT_SEL,0x80);
-    // page 1: hardware low-pass + range (vibrasiya kesimi)
-    w8(BNO055_ADDR,BNO055_PAGE_ID,0x01);
-    w8(BNO055_ADDR,BNO055_ACC_CFG,0x0C);   // acc_bw 62.5Hz, range +-2g (0.01 m/s2/LSB)
-    w8(BNO055_ADDR,BNO055_GYR_CFG0,0x38);  // gyr_bw 32Hz, range 2000dps
-    w8(BNO055_ADDR,BNO055_PAGE_ID,0x00);
-    w8(BNO055_ADDR,BNO055_SYS_TRIG,0x80);delay(50);
-    w8(BNO055_ADDR,BNO055_OPR_MODE,0x0C);delay(200);
+    w8(BNO055_ADDR,BNO055_OPR_MODE,0x00);delay(30);   // CONFIG rejimi
+    w8(BNO055_ADDR,BNO055_SYS_TRIG,0x20);delay(650);  // RST_SYS (duzgun reset)
+    w8(BNO055_ADDR,BNO055_PWR_MODE,0x00);delay(10);   // normal guc
+    w8(BNO055_ADDR,BNO055_UNIT_SEL,0x00);             // m/s2, dps, deg, C
+    w8(BNO055_ADDR,BNO055_OPR_MODE,0x0C);delay(200);  // NDOF fusion
     return true;
 }
 static void bno055_read_raw(float&ax,float&ay,float&az,float&gx,float&gy,float&gz,float&mx,float&my,float&mz){
@@ -257,8 +250,32 @@ static void bno055_read_raw(float&ax,float&ay,float&az,float&gx,float&gy,float&g
     rBuf(BNO055_ADDR,BNO055_MAG_START,buf,6);mx=(int16_t)((buf[1]<<8)|buf[0])*BNO055_MAG_SCALE;my=(int16_t)((buf[3]<<8)|buf[2])*BNO055_MAG_SCALE;mz=(int16_t)((buf[5]<<8)|buf[4])*BNO055_MAG_SCALE;
 }
 
-// ======================== I2C SCAN ========================
-static void i2c_scan(){Serial.println(F("--- I2C Scan ---"));uint8_t cnt=0;for(uint8_t a=0x03;a<0x78;a++){Wire.beginTransmission(a);if(!Wire.endTransmission()){Serial.print(F("  0x"));Serial.println(a,HEX);cnt++;}}Serial.print(F("  Total: "));Serial.print(cnt);Serial.println(F(" dev"));}
+// ======================== I2C SCAN + DIAQNOSTIKA ========================
+static void i2c_scan_diag(){
+    uint8_t addrs[16]; uint8_t n=0;
+    for(uint8_t a=0x03;a<0x78;a++){
+        Wire.beginTransmission(a);
+        if(Wire.endTransmission()==0){ if(n<16) addrs[n++]=a; }
+    }
+    bool bno=false,bme=false,aht=false;
+    for(uint8_t i=0;i<n;i++){
+        if(addrs[i]==BNO055_ADDR)bno=true;
+        else if(addrs[i]==BME280_ADDR)bme=true;
+        else if(addrs[i]==AHT20_ADDR)aht=true;
+    }
+    // USB
+    Serial.print(F("[I2C] "));Serial.print(n);Serial.print(F(" dev | BNO055="));Serial.print(bno?1:0);
+    Serial.print(F(" BME280="));Serial.print(bme?1:0);Serial.print(F(" AHT20="));Serial.print(aht?1:0);
+    Serial.print(F(" | "));
+    for(uint8_t i=0;i<n;i++){Serial.print(F("0x"));Serial.print(addrs[i],HEX);Serial.print(' ');}
+    Serial.println();
+    // RF (RFD900X) diaqnostik sətir
+    RF_SERIAL.print(F("DIAG,"));RF_SERIAL.print(millis());RF_SERIAL.print(',');
+    RF_SERIAL.print(bno?1:0);RF_SERIAL.print(',');RF_SERIAL.print(bme?1:0);RF_SERIAL.print(',');RF_SERIAL.print(aht?1:0);
+    RF_SERIAL.print(',');RF_SERIAL.print(n);
+    for(uint8_t i=0;i<n;i++){RF_SERIAL.print(',');RF_SERIAL.print(F("0x"));RF_SERIAL.print(addrs[i],HEX);}
+    RF_SERIAL.println();
+}
 
 // ======================== SETUP ========================
 void setup(){
@@ -280,9 +297,11 @@ void setup(){
     Serial.println(F("[RF-CMD] RX: '1'=ARM, '0'=DISARM"));
 #endif
 
+    RF_SERIAL.begin(RF_BAUD);
+
     Wire.begin();Wire.setClock(I2C_FREQ);
     Serial.print(F("[I2C] "));Serial.print(I2C_FREQ/1000);Serial.println(F(" kHz"));
-    i2c_scan();
+    i2c_scan_diag();
 
     ok.bno055=bno055_init();
     Serial.print(F("BNO055: "));Serial.println(ok.bno055?F("100 Hz"):F("FAIL"));
@@ -306,13 +325,12 @@ void setup(){
     ekf.init(0.0f, 0.0f, 9.80665f);
     Serial.println(F("[FILTER] Attitude EKF: 7-state quaternion (gyro+accel), 100 Hz"));
 
-    RF_SERIAL.begin(RF_BAUD);
     Serial.print(F("[RF] Serial2 @ "));Serial.print(RF_BAUD);Serial.print(F(" baud, Header: "));
     Serial.print(DEVICE_HEADER);Serial.println(F(", 15 Hz CSV"));
     Serial.println(F("Packet: XX,ts,AX..AZ,GX..GZ,MX..MZ,T,P,H,Alt,aT,aH,lat,lon,gps_alt,spd,crs,roll,pitch,yaw\n"));
 
     uint32_t now=millis();
-    lastBno=lastBme=lastAht=lastGps=lastPrn=lastRf=now;
+    lastBno=lastBme=lastAht=lastGps=lastPrn=lastRf=lastI2cDiag=now;
 #if DEVICE_TYPE == 3
     lastFlight=now;
 #endif
@@ -350,6 +368,7 @@ void loop(){
     }
     if(ok.aht20&&now-lastAht>=AHT20_PERIOD){lastAht=now;if(aht_triggered)aht20_read_finish(aht_t,aht_h);aht20_trigger();}
     gps_read();if(now-lastGps>=GPS_PERIOD){lastGps=now;ok.gps_fix=(gps.fix>0);}
+    if(now-lastI2cDiag>=I2C_DIAG_PERIOD){lastI2cDiag=now;i2c_scan_diag();}
 
     static bool led=false;if(now&0x200){if(!led){digitalWrite(LED_PIN,HIGH);led=true;}}else{if(led){digitalWrite(LED_PIN,LOW);led=false;}}
 
