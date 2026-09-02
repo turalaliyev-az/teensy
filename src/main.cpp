@@ -8,6 +8,7 @@
 #include <Adafruit_AHTX0.h>
 
 // ======================== SENSOR OBYEKTLERI ========================
+// BNO055: Sensor ID=55, Unvan=0x28, Wire obyekti
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 Adafruit_BME280 bme;
 Adafruit_AHTX0 aht;
@@ -19,7 +20,7 @@ Adafruit_AHTX0 aht;
 #define ESC_US_MIN    1000
 #define ESC_US_MAX    2000
 #define ESC_US_OFF    1000    
-#define ESC_US_TEST   1150    // TEST REJIMI UCUN YENI DEYER (Asagi suret)
+#define ESC_US_RUN    1480    
 
 void esc_init();
 void esc_write_us(uint16_t us);
@@ -195,7 +196,7 @@ void AltVel::update(float pressure_hpa, float az, float ax, float ay) {
     _P11 = P11_p - K1 * P01_p;
 }
 
-// ======================== UCUS NEZARETCISI (SINAQ REJIMI) ========================
+// ======================== UCUS NEZARETCISI ========================
 enum FlightState : uint8_t { FS_DISARMED = 0, FS_ARMED = 1, FS_MOTORS_ON = 2 };
 
 struct FlightCtrl {
@@ -211,6 +212,10 @@ private:
     uint32_t _last_ms;
 };
 
+#define ALT_TRIGGER_M   500.0f
+#define RAMP_MS         500UL
+#define RAMP_STEP_US    ((float)(ESC_US_RUN - ESC_US_OFF) / (float)RAMP_MS)  
+
 void FlightCtrl::init() {
     state = FS_DISARMED;
     throttle_us = (float)ESC_US_OFF;
@@ -218,9 +223,13 @@ void FlightCtrl::init() {
 }
 
 void FlightCtrl::update(bool armed, bool level_ok, bool descending, float rel_alt, uint32_t now_ms) {
+    uint32_t dt_ms = 0;
+    if (_last_ms != 0) {
+        dt_ms = now_ms - _last_ms;
+        if (dt_ms > 100) dt_ms = 100;   
+    }
     _last_ms = now_ms;
 
-    // DISARM her zaman ustundur: derhal 1000 us
     if (!armed) {
         state = FS_DISARMED;
         throttle_us = (float)ESC_US_OFF;
@@ -228,10 +237,24 @@ void FlightCtrl::update(bool armed, bool level_ok, bool descending, float rel_al
         return;
     }
 
-    // SINAQ REJIMI: Level ve descending sertleri helelik nezere alinmir.
-    // RF-den '1' geldiyi an motorlar 1150 us alir.
-    state = FS_MOTORS_ON;
-    throttle_us = (float)ESC_US_TEST;
+    switch (state) {
+    case FS_DISARMED:
+        throttle_us = (float)ESC_US_OFF;
+        state = FS_ARMED;
+        break;
+    case FS_ARMED:
+        if (level_ok && descending && rel_alt <= ALT_TRIGGER_M) {
+            state = FS_MOTORS_ON;
+        }
+        break;
+    case FS_MOTORS_ON:
+        if (!level_ok) break;
+        if (throttle_us < (float)ESC_US_RUN) {
+            throttle_us += RAMP_STEP_US * (float)dt_ms;
+            if (throttle_us > (float)ESC_US_RUN) throttle_us = (float)ESC_US_RUN;
+        }
+        break;
+    }
     esc_write_us((uint16_t)throttle_us);
 }
 
@@ -567,7 +590,6 @@ void setup(){
     Serial.begin(115200);
     delay(200);
     Serial.println(F("\n=== TEENSY 4.1 " DEVICE_NAME " ==="));
-    Serial.println(F("[REJIM] ESC SINAQ REJIMI AKTIV (ARM=1150us, DISARM=1000us)"));
     rf_command_init(); 
     altvel.init(); 
     flight.init();
@@ -583,6 +605,7 @@ void setup(){
         ok.bno055 = false;
     } else {
         ok.bno055 = true;
+        // Klonlarda xarici kristal olmaya biler, ona gore false edirik
         bno.setExtCrystalUse(false); 
         delay(100);
         uint8_t sys, gyro, accel, mag;
@@ -627,7 +650,7 @@ void setup(){
     GPS_SERIAL.begin(GPS_BAUD);
     Serial.print(F("GPS:    Serial7 @ ")); Serial.print(GPS_BAUD); Serial.println(F(" baud"));
     
-    // EKF Init
+    // EKF Init (Sabit durduqda Z oxu 9.81 m/s^2 olmalidir)
     ekf.init(0.0f, 0.0f, 9.80665f);
     Serial.println(F("[FILTER] Attitude EKF initialized"));
     
@@ -657,8 +680,6 @@ void loop(){
             wasLevel=level;
         }
         bool descending = (altvel.vel < 0.0f);
-        
-        // SINAQ REJIMI: level ve descending false olsa bele, flight.update() sadece armed statusunu yoxlayacaq
         flight.update(rf_armed(), level, descending, altvel.rel_alt, now);
     }
 
@@ -667,6 +688,7 @@ void loop(){
         lastBno=now;
         if(ok.bno055){
             sensors_event_t event;
+            // Kitabxana avtomatik olaraq m/s^2 ve rad/s qaytarir
             bno.getEvent(&event, Adafruit_BNO055::VECTOR_ACCELEROMETER);
             ax = event.acceleration.x;
             ay = event.acceleration.y;
@@ -693,13 +715,14 @@ void loop(){
         lastBme=now;
         if(ok.bme280){
             bme_t = bme.readTemperature();
-            bme_p = bme.readPressure() / 100.0f;
+            bme_p = bme.readPressure() / 100.0f; // Pa -> hPa
             bme_h = bme.readHumidity();
             bme_a = bme.readAltitude(SEA_LEVEL_HPA);
             
             bme_tk = kalmanTemp.update(bme_t);
             bme_ak = kalmanAlt.update(bme_a); 
             
+            // Hundurluk ve Suret sensoru (AltVel) yenilenir
             altvel.update(bme_p, az, ax, ay);
         }
     }
@@ -751,11 +774,7 @@ void loop(){
         else { Serial.print(F("NO")); }
         
         Serial.print(F(" | FLT:"));
-        if(rf_armed()) {
-            Serial.print(F("[MOTOR-TEST]"));
-        } else {
-            Serial.print(F("DISARM"));
-        }
+        Serial.print(rf_armed()?F("ARM"):F("DISARM")); 
         Serial.print('/'); Serial.print((int)flight.state_code());
         Serial.print(F(" alt=")); Serial.print(altvel.rel_alt,1); 
         Serial.print(F(" vel=")); Serial.print(altvel.vel,1);
