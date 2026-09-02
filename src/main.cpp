@@ -2,12 +2,16 @@
 #include <Wire.h>
 #include <math.h>
 
-#include <Adafruit_BME280.h>
-#include <Adafruit_BNO055.h>
 #include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_AHTX0.h>
 
-Adafruit_BME280 bme;
+// ======================== SENSOR OBYEKTLERI ========================
+// BNO055: Sensor ID=55, Unvan=0x28, Wire obyekti
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
+Adafruit_BME280 bme;
+Adafruit_AHTX0 aht;
 
 // ======================== ESC (50 Hz PWM) ========================
 #define ESC1_PIN      15      
@@ -46,6 +50,7 @@ void esc_write_us(uint16_t us) {
     esc_write_us(us, us);
 }
 
+// ======================== RF EMRLERİ ========================
 static bool _armed = false;
 static bool _last_ack = false;   
 
@@ -191,6 +196,7 @@ void AltVel::update(float pressure_hpa, float az, float ax, float ay) {
     _P11 = P11_p - K1 * P01_p;
 }
 
+// ======================== UCUS NEZARETCISI ========================
 enum FlightState : uint8_t { FS_DISARMED = 0, FS_ARMED = 1, FS_MOTORS_ON = 2 };
 
 struct FlightCtrl {
@@ -474,6 +480,7 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
     yaw   = atan2f(2.0f*(q[0]*q[3] + q[1]*q[2]), 1.0f - 2.0f*(q[2]*q[2] + q[3]*q[3])) * RAD2DEG;
 }
 
+// ======================== UMUMI SABITLER ========================
 #define DEVICE_HEADER F("CC")   
 #define DEVICE_NAME   "DRONE (CC)"
 #define LED_PIN         13
@@ -481,10 +488,7 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define RF_BAUD         115200
 #define GPS_SERIAL      Serial7       
 #define GPS_BAUD        9600
-#define I2C_FREQ        100000UL     // Diqqət: 400kHz əvəzinə 100kHz
-#define BNO055_ADDR     0x28
-#define BME280_ADDR     0x76
-#define AHT20_ADDR      0x38
+#define I2C_FREQ        400000UL
 #define BNO055_PERIOD   10    
 #define BME280_PERIOD   40    
 #define AHT20_PERIOD    1000  
@@ -492,30 +496,9 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define PRINT_PERIOD    200   
 #define RF_PERIOD       66    
 #define FLIGHT_PERIOD   10    
-#define I2C_DIAG_PERIOD 5000  
+#define SEA_LEVEL_HPA   1013.25f
 
-// Digər təyinatlar ... (kodunuzda olduğu kimi)
-#define BNO055_CHIP_ID      0x00
-#define BNO055_OPR_MODE     0x3D
-#define BNO055_PWR_MODE     0x3E
-#define BNO055_SYS_TRIG     0x3F
-#define BNO055_UNIT_SEL     0x3B
-#define BNO055_CALIB_STAT   0x35
-#define BNO055_PAGE_ID      0x07
-#define BNO055_ACC_START    0x08
-#define BNO055_MAG_START    0x0E
-#define BNO055_GYRO_START   0x14
-#define BME280_CHIP_ID      0xD0
-#define BME280_CTRL_HUM     0xF2
-#define BME280_CTRL_MEAS    0xF4
-#define BME280_CONFIG       0xF5
-#define BME280_DATA_START   0xF7
-#define BME280_CALIB_START  0x88
-#define AHT20_CMD_INIT      0xBE
-#define AHT20_CMD_TRIG      0xAC
-#define AHT20_STAT_CAL      0x08
-#define AHT20_STAT_BUSY     0x80
-
+// ======================== GPS NMEA PARSER ========================
 static float nmea_to_decimal(float ddmm) {
     int deg = (int)(ddmm / 100.0f); 
     float min = ddmm - (float)(deg * 100);
@@ -531,57 +514,6 @@ struct GPSData {
 static GPSData gps; 
 static char gps_buf[128]; 
 static uint8_t gps_idx = 0;
-
-struct Kalman1D {
-    float Q,R,P,K,X;
-    void init(float q,float r,float x0){Q=q;R=r;P=1;K=0;X=x0;}
-    float update(float z){P+=Q;K=P/(P+R);X+=K*(z-X);P=(1-K)*P;return X;}
-};
-
-static struct{uint8_t bno055:1,bme280:1,aht20:1,gps_fix:1;} ok;
-static AttitudeEKF ekf;
-static Kalman1D kalmanTemp,kalmanAlt;
-static bool kalman_ready=false,aht_triggered=false;
-static uint32_t aht_trigger_ms=0,lastBno,lastBme,lastAht,lastGps,lastPrn,lastRf,lastI2cDiag;
-static uint32_t lastFlight;
-static AltVel altvel;
-static FlightCtrl flight;
-
-static float ax,ay,az,gx,gy,gz,mx,my,mz;
-static float bme_t,bme_p,bme_h,bme_a,bme_tk,bme_ak;
-static float aht_t,aht_h;
-static float mad_roll,mad_pitch,mad_yaw;
-
-static inline void w8(uint8_t a,uint8_t r,uint8_t v){
-    Wire.beginTransmission(a);
-    Wire.write(r);
-    Wire.write(v);
-    Wire.endTransmission();
-}
-
-static inline uint8_t r8(uint8_t a,uint8_t r){
-    Wire.beginTransmission(a);
-    Wire.write(r);
-    Wire.endTransmission(false);
-    if(Wire.requestFrom(a, (uint8_t)1) == 1) {
-        return Wire.read();
-    }
-    return 0xFF;
-}
-
-static inline void rBuf(uint8_t a,uint8_t r,uint8_t*b,uint8_t n){
-    Wire.beginTransmission(a);
-    Wire.write(r);
-    Wire.endTransmission(false);
-    uint8_t read = Wire.requestFrom(a, n);
-    for(uint8_t i=0; i<n; i++) {
-        if(i < read) {
-            b[i] = Wire.read();
-        } else {
-            b[i] = 0;
-        }
-    }
-}
 
 static void gps_parse_gpgga(char*s){
     char*p=s; 
@@ -630,106 +562,27 @@ static void gps_read(){
     }
 }
 
-// BME280 Üçün Düzəliş 
-static bool bme280_init(){
-    return bme.begin(BME280_ADDR, &Wire); // I2C ünvanını aşkar göstəririk
-}
+// ======================== KALMAN VƏ STATUS ========================
+struct Kalman1D {
+    float Q,R,P,K,X;
+    void init(float q,float r,float x0){Q=q;R=r;P=1;K=0;X=x0;}
+    float update(float z){P+=Q;K=P/(P+R);X+=K*(z-X);P=(1-K)*P;return X;}
+};
 
-static void bme280_read(float&t,float&p,float&h,float&a){
-    t = bme.readTemperature();
-    p = bme.readPressure() / 100.0f;   // Pa -> hPa
-    h = bme.readHumidity();
-    a = bme.readAltitude(1013.25f);
-}
+static struct{uint8_t bno055:1,bme280:1,aht20:1,gps_fix:1;} ok;
+static AttitudeEKF ekf;
+static Kalman1D kalmanTemp,kalmanAlt;
+static uint32_t lastBno,lastBme,lastAht,lastGps,lastPrn,lastRf;
+static uint32_t lastFlight;
+static AltVel altvel;
+static FlightCtrl flight;
 
-static bool aht20_init(){
-    Wire.beginTransmission(AHT20_ADDR);
-    Wire.write(AHT20_CMD_INIT);
-    Wire.write(0x08);
-    Wire.write(0x00);
-    if(Wire.endTransmission()) {
-        return false;
-    }
-    delay(40); 
-    uint8_t s = r8(AHT20_ADDR, 0x71); 
-    return (s & AHT20_STAT_CAL) != 0;
-}
+static float ax,ay,az,gx,gy,gz,mx,my,mz;
+static float bme_t,bme_p,bme_h,bme_a,bme_tk,bme_ak;
+static float aht_t,aht_h;
+static float mad_roll,mad_pitch,mad_yaw;
 
-static void aht20_trigger(){
-    Wire.beginTransmission(AHT20_ADDR);
-    Wire.write(AHT20_CMD_TRIG);
-    Wire.write(0x33);
-    Wire.write(0x00);
-    Wire.endTransmission(); 
-    aht_triggered=true; 
-    aht_trigger_ms=millis();
-}
-
-static void aht20_read_finish(float&t,float&h){
-    if(!aht_triggered) {
-        return;
-    }
-    if(millis() - aht_trigger_ms < 80) {
-        return;
-    }
-    uint8_t buf[7]; 
-    rBuf(AHT20_ADDR, 0x00, buf, 7); 
-    aht_triggered=false;
-    if(buf[0] & AHT20_STAT_BUSY) {
-        return; 
-    }
-    uint32_t rh=((uint32_t)buf[1]<<12)|((uint32_t)buf[2]<<4)|(buf[3]>>4);
-    uint32_t rt=(((uint32_t)buf[3]&0x0F)<<16)|((uint32_t)buf[4]<<8)|buf[5];
-    h=(float)rh*9.5367431640625e-5f; 
-    t=(float)rt*1.9073486328125e-4f-50.0f;
-}
-
-static bool bno055_init(){
-    if(!bno.begin()) return false;
-    delay(50); // Sensorun özünə gəlməsi üçün
-    bno.setExtCrystalUse(true);   // xarici kristal — VACIB
-    return true;
-}
-
-// BNO055 Oxuma Xətası Düzəldildi
-static void bno055_read_raw(float&ax,float&ay,float&az,float&gx,float&gy,float&gz,float&mx,float&my,float&mz){
-    // İvəölçən
-    imu::Vector<3> accel = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
-    ax = accel.x(); ay = accel.y(); az = accel.z();
-    
-    // Jiroskop
-    imu::Vector<3> gyro = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
-    gx = gyro.x(); gy = gyro.y(); gz = gyro.z();
-    
-    // Maqnitometr
-    imu::Vector<3> mag = bno.getVector(Adafruit_BNO055::VECTOR_MAGNETOMETER);
-    mx = mag.x(); my = mag.y(); mz = mag.z();
-}
-
-static void i2c_scan_diag(){
-    uint8_t addrs[16]; 
-    uint8_t n=0;
-    for(uint8_t a=0x03;a<0x78;a++){ 
-        Wire.beginTransmission(a); 
-        if(Wire.endTransmission()==0){ 
-            if(n<16) addrs[n++]=a; 
-        } 
-    }
-    bool bno_found=false,bme_found=false,aht_found=false;
-    for(uint8_t i=0;i<n;i++){ 
-        if(addrs[i]==BNO055_ADDR) bno_found=true; 
-        else if(addrs[i]==BME280_ADDR) bme_found=true; 
-        else if(addrs[i]==AHT20_ADDR) aht_found=true; 
-    }
-    uint8_t opmode = bno_found ? r8(BNO055_ADDR, BNO055_OPR_MODE) : 0xFF;
-    uint8_t calib  = bno_found ? r8(BNO055_ADDR, BNO055_CALIB_STAT) : 0xFF;
-    Serial.print(F("[I2C] "));Serial.print(n);Serial.print(F(" dev | BNO055="));Serial.print(bno_found?1:0);
-    Serial.print(F(" BME280="));Serial.print(bme_found?1:0);Serial.print(F(" AHT20="));Serial.print(aht_found?1:0);
-    Serial.print(F(" | mode=0x"));Serial.print(opmode,HEX); 
-    Serial.print(F(" cal=0x"));Serial.print(calib,HEX); 
-    Serial.println();
-}
-
+// ======================== SETUP ========================
 void setup(){
     pinMode(LED_PIN,OUTPUT);
     digitalWrite(LED_PIN,HIGH);
@@ -743,53 +596,78 @@ void setup(){
     RF_SERIAL.begin(RF_BAUD);
     
     Wire.begin();
-    Wire.setClock(I2C_FREQ); 
-    i2c_scan_diag();
+    Wire.setClock(I2C_FREQ);
     
-    ok.bno055=bno055_init();
+    // BNO055 Init
     Serial.print(F("BNO055: "));
-    Serial.println(ok.bno055?F("100 Hz NDOF OK"):F("FAIL (Check Wiring/Crystal)"));
-    if(ok.bno055){
-        uint8_t cal=r8(BNO055_ADDR,BNO055_CALIB_STAT);
-        Serial.print(F("  Cal:"));Serial.print(cal>>6);Serial.print('/');Serial.print((cal>>4)&3);
-        Serial.print('/');Serial.print((cal>>2)&3);Serial.print('/');Serial.println(cal&3);
-    }
-
-    ok.bme280=bme280_init();
-    Serial.print(F("BME280: "));
-    if(ok.bme280){
-        Serial.println(F("25 Hz OK"));
-        float t,p,h,a;
-        bme280_read(t,p,h,a);
-        kalmanTemp.init(0.001f,0.5f,t);
-        kalmanAlt.init(0.01f,2.0f,a);
-        kalman_ready=true;
+    if(!bno.begin()) {
+        Serial.println(F("FAIL (Check Wiring)"));
+        ok.bno055 = false;
     } else {
-        Serial.println(F("FAIL"));
+        ok.bno055 = true;
+        // Klonlarda xarici kristal olmaya biler, ona gore false edirik
+        bno.setExtCrystalUse(false); 
+        delay(100);
+        uint8_t sys, gyro, accel, mag;
+        bno.getCalibration(&sys, &gyro, &accel, &mag);
+        Serial.print(F("OK (Cal: ")); Serial.print(sys); Serial.print('/'); 
+        Serial.print(gyro); Serial.print('/'); Serial.print(accel); Serial.print('/'); Serial.print(mag); Serial.println(F(")"));
     }
 
-    ok.aht20=aht20_init();
+    // BME280 Init
+    Serial.print(F("BME280: "));
+    if (!bme.begin(0x76, &Wire)) {
+        Serial.println(F("FAIL (Check Address/Wiring)"));
+        ok.bme280 = false;
+    } else {
+        ok.bme280 = true;
+        bme.setSampling(Adafruit_BME280::MODE_NORMAL,
+                        Adafruit_BME280::SAMPLING_X2,  // Temp
+                        Adafruit_BME280::SAMPLING_X16, // Pressure
+                        Adafruit_BME280::SAMPLING_X1,  // Humidity
+                        Adafruit_BME280::FILTER_X16,
+                        Adafruit_BME280::STANDBY_MS_0_5);
+        Serial.println(F("25 Hz OK"));
+        bme_t = bme.readTemperature();
+        bme_a = bme.readAltitude(SEA_LEVEL_HPA);
+        kalmanTemp.init(0.001f, 0.5f, bme_t);
+        kalmanAlt.init(0.01f, 2.0f, bme_a);
+    }
+
+    // AHT20 Init
     Serial.print(F("AHT20:  "));
-    Serial.println(ok.aht20?F("1 Hz OK"):F("FAIL/OFF"));
+    if (!aht.begin()) {
+        Serial.println(F("FAIL/OFF"));
+        ok.aht20 = false;
+    } else {
+        ok.aht20 = true;
+        Serial.println(F("1 Hz OK"));
+    }
     aht_t = 0.0f; 
     aht_h = 0.0f; 
-    if(ok.aht20) {
-        aht20_trigger();
-    }
 
+    // GPS Init
     GPS_SERIAL.begin(GPS_BAUD);
-    ekf.init(0.0f, 0.0f, 9.80665f);
+    Serial.print(F("GPS:    Serial7 @ ")); Serial.print(GPS_BAUD); Serial.println(F(" baud"));
     
+    // EKF Init (Sabit durduqda Z oxu 9.81 m/s^2 olmalidir)
+    ekf.init(0.0f, 0.0f, 9.80665f);
+    Serial.println(F("[FILTER] Attitude EKF initialized"));
+    
+    Serial.print(F("[RF] Serial2 @ ")); Serial.print(RF_BAUD); Serial.print(F(" baud, Header: ")); Serial.println(DEVICE_HEADER);
+
     uint32_t now=millis();
-    lastBno=lastBme=lastAht=lastGps=lastPrn=lastRf=lastI2cDiag=now; 
+    lastBno=lastBme=lastAht=lastGps=lastPrn=lastRf=now; 
     lastFlight=now;
     digitalWrite(LED_PIN,LOW);
 }
 
+// ======================== LOOP ========================
 void loop(){
     uint32_t now=millis();
     rf_command_update();
 
+    // Ucus Nezaretcisi (100 Hz)
     if(now-lastFlight>=FLIGHT_PERIOD){
         lastFlight=now;
         static bool wasLevel=false;
@@ -805,130 +683,152 @@ void loop(){
         flight.update(rf_armed(), level, descending, altvel.rel_alt, now);
     }
 
+    // IMU / BNO055 (100 Hz)
     if(now-lastBno>=BNO055_PERIOD){
         lastBno=now;
         if(ok.bno055){
-            bno055_read_raw(ax,ay,az,gx,gy,gz,mx,my,mz);
-            ekf.predict(gx,gy,gz,0.01f);
-            ekf.update(ax,ay,az);
-            ekf.getEulerDeg(mad_roll,mad_pitch,mad_yaw);
+            sensors_event_t event;
+            // Kitabxana avtomatik olaraq m/s^2 ve rad/s qaytarir
+            bno.getEvent(&event, Adafruit_BNO055::VECTOR_ACCELEROMETER);
+            ax = event.acceleration.x;
+            ay = event.acceleration.y;
+            az = event.acceleration.z;
+            
+            bno.getEvent(&event, Adafruit_BNO055::VECTOR_GYROSCOPE);
+            gx = event.gyro.x; 
+            gy = event.gyro.y; 
+            gz = event.gyro.z;
+            
+            bno.getEvent(&event, Adafruit_BNO055::VECTOR_MAGNETOMETER);
+            mx = event.magnetic.x;
+            my = event.magnetic.y;
+            mz = event.magnetic.z;
+            
+            ekf.predict(gx, gy, gz, 0.01f);
+            ekf.update(ax, ay, az);
+            ekf.getEulerDeg(mad_roll, mad_pitch, mad_yaw);
         }
     }
+    
+    // Baro / BME280 (25 Hz)
     if(now-lastBme>=BME280_PERIOD){
         lastBme=now;
         if(ok.bme280){
-            bme280_read(bme_t,bme_p,bme_h,bme_a);
-            bme_tk=kalmanTemp.update(bme_t);
-            bme_ak=kalmanAlt.update(bme_a); 
+            bme_t = bme.readTemperature();
+            bme_p = bme.readPressure() / 100.0f; // Pa -> hPa
+            bme_h = bme.readHumidity();
+            bme_a = bme.readAltitude(SEA_LEVEL_HPA);
+            
+            bme_tk = kalmanTemp.update(bme_t);
+            bme_ak = kalmanAlt.update(bme_a); 
+            
+            // Hundurluk ve Suret sensoru (AltVel) yenilenir
             altvel.update(bme_p, az, ax, ay);
         }
     }
+    
+    // Temp / AHT20 (1 Hz)
     if(ok.aht20 && now-lastAht>=AHT20_PERIOD){
         lastAht=now;
-        if(aht_triggered) {
-            aht20_read_finish(aht_t,aht_h);
-        }
-        aht20_trigger();
+        sensors_event_t humidity, temp;
+        aht.getEvent(&humidity, &temp);
+        aht_t = temp.temperature;
+        aht_h = humidity.relative_humidity;
     }
+    
+    // GPS (Oxunma)
     gps_read();
     if(now-lastGps>=GPS_PERIOD){
         lastGps=now;
         ok.gps_fix=(gps.fix>0);
     }
-    if(now-lastI2cDiag>=I2C_DIAG_PERIOD){
-        lastI2cDiag=now;
-        i2c_scan_diag();
-    }
 
+    // Status LED
     static bool led=false;
     if(now&0x200){
-        if(!led){
-            digitalWrite(LED_PIN,HIGH);
-            led=true;
-        }
+        if(!led){ digitalWrite(LED_PIN,HIGH); led=true; }
     }else{
-        if(led){
-            digitalWrite(LED_PIN,LOW);
-            led=false;
-        }
+        if(led){ digitalWrite(LED_PIN,LOW); led=false; }
     }
 
+    // USB Serial Cixisi (5 Hz)
     if(now-lastPrn>=PRINT_PERIOD){
         lastPrn=now;
-        Serial.print(now);Serial.print(' ');
+        Serial.print(now); Serial.print(' ');
         if(ok.bno055){
-            Serial.print(F("A:"));Serial.print(ax,2);Serial.print(',');Serial.print(ay,2);Serial.print(',');Serial.print(az,2);
-            Serial.print(F(" G:"));Serial.print(gx,3);Serial.print(',');Serial.print(gy,3);Serial.print(',');Serial.print(gz,3);
+            Serial.print(F("A:")); Serial.print(ax,2); Serial.print(','); Serial.print(ay,2); Serial.print(','); Serial.print(az,2);
+            Serial.print(F(" G:")); Serial.print(gx,3); Serial.print(','); Serial.print(gy,3); Serial.print(','); Serial.print(gz,3);
         } else {
             Serial.print(F("IMU:OFF"));
         }
         Serial.print(F(" | T:"));
-        if(ok.bme280){
-            Serial.print(bme_tk,1);Serial.print('/');Serial.print(bme_ak,1);
-        } else {
-            Serial.print(F("OFF"));
-        }
+        if(ok.bme280){ Serial.print(bme_tk,1); Serial.print('/'); Serial.print(bme_ak,1); } 
+        else { Serial.print(F("OFF")); }
+        
         Serial.print(F(" | A:"));
-        if(ok.aht20 && !isnan(aht_t) && aht_t != 0.0f){
-            Serial.print(aht_t,1);Serial.print('/');Serial.print(aht_h,1);
-        } else {
-            Serial.print(F("OFF"));
-        }
+        if(ok.aht20 && !isnan(aht_t)){ Serial.print(aht_t,1); Serial.print('/'); Serial.print(aht_h,1); } 
+        else { Serial.print(F("OFF")); }
+        
         Serial.print(F(" | GPS:"));
-        if(ok.gps_fix){
-            Serial.print(gps.lat,5);Serial.print(',');Serial.print(gps.lon,5);
-        } else {
-            Serial.print(F("NO"));
-        }
+        if(ok.gps_fix){ Serial.print(gps.lat,5); Serial.print(','); Serial.print(gps.lon,5); } 
+        else { Serial.print(F("NO")); }
+        
         Serial.print(F(" | FLT:"));
         Serial.print(rf_armed()?F("ARM"):F("DISARM")); 
-        Serial.print('/');Serial.print((int)flight.state_code());
-        Serial.print(F(" alt="));Serial.print(altvel.rel_alt,1); 
-        Serial.print(F(" vel="));Serial.print(altvel.vel,1);
-        Serial.print(F(" g="));Serial.print(altvel.g_force,2); 
-        Serial.print(F(" pwm="));Serial.print(flight.throttle()); 
+        Serial.print('/'); Serial.print((int)flight.state_code());
+        Serial.print(F(" alt=")); Serial.print(altvel.rel_alt,1); 
+        Serial.print(F(" vel=")); Serial.print(altvel.vel,1);
+        Serial.print(F(" g=")); Serial.print(altvel.g_force,2); 
+        Serial.print(F(" pwm=")); Serial.print(flight.throttle()); 
         Serial.println();
     }
 
+    // RF Modula Gonderme (15 Hz)
     if(now-lastRf>=RF_PERIOD){
         lastRf=now;
-        RF_SERIAL.print(DEVICE_HEADER);RF_SERIAL.print(','); 
-        RF_SERIAL.print(now);RF_SERIAL.print(',');
+        RF_SERIAL.print(DEVICE_HEADER); RF_SERIAL.print(','); 
+        RF_SERIAL.print(now); RF_SERIAL.print(',');
+        
         if(ok.bno055){
-            RF_SERIAL.print(ax,3);RF_SERIAL.print(',');RF_SERIAL.print(ay,3);RF_SERIAL.print(',');RF_SERIAL.print(az,3);RF_SERIAL.print(',');
-            RF_SERIAL.print(gx,4);RF_SERIAL.print(',');RF_SERIAL.print(gy,4);RF_SERIAL.print(',');RF_SERIAL.print(gz,4);RF_SERIAL.print(',');
-            RF_SERIAL.print(mx,2);RF_SERIAL.print(',');RF_SERIAL.print(my,2);RF_SERIAL.print(',');RF_SERIAL.print(mz,2);
+            RF_SERIAL.print(ax,3); RF_SERIAL.print(','); RF_SERIAL.print(ay,3); RF_SERIAL.print(','); RF_SERIAL.print(az,3); RF_SERIAL.print(',');
+            RF_SERIAL.print(gx,4); RF_SERIAL.print(','); RF_SERIAL.print(gy,4); RF_SERIAL.print(','); RF_SERIAL.print(gz,4); RF_SERIAL.print(',');
+            RF_SERIAL.print(mx,2); RF_SERIAL.print(','); RF_SERIAL.print(my,2); RF_SERIAL.print(','); RF_SERIAL.print(mz,2);
         }else{
             RF_SERIAL.print(F("N,N,N,N,N,N,N,N,N"));
         }
         RF_SERIAL.print(',');
+        
         if(ok.bme280){
-            RF_SERIAL.print(bme_tk,1);RF_SERIAL.print(',');RF_SERIAL.print(bme_p,1);RF_SERIAL.print(',');RF_SERIAL.print(bme_h,1);RF_SERIAL.print(',');RF_SERIAL.print(bme_ak,1);
+            RF_SERIAL.print(bme_tk,1); RF_SERIAL.print(','); RF_SERIAL.print(bme_p,1); RF_SERIAL.print(','); 
+            RF_SERIAL.print(bme_h,1); RF_SERIAL.print(','); RF_SERIAL.print(bme_ak,1);
         } else {
             RF_SERIAL.print(F("N,N,N,N"));
         }
         RF_SERIAL.print(',');
+        
         if(ok.aht20 && !isnan(aht_t)){
-            RF_SERIAL.print(aht_t,1);RF_SERIAL.print(',');RF_SERIAL.print(aht_h,1);
+            RF_SERIAL.print(aht_t,1); RF_SERIAL.print(','); RF_SERIAL.print(aht_h,1);
         }else{
             RF_SERIAL.print(F("N,N"));
         }
         RF_SERIAL.print(',');
+        
         if(ok.gps_fix){
-            RF_SERIAL.print(gps.lat,6);RF_SERIAL.print(',');RF_SERIAL.print(gps.lon,6);RF_SERIAL.print(',');
-            RF_SERIAL.print(gps.altitude,1);RF_SERIAL.print(',');RF_SERIAL.print(gps.speed,2);RF_SERIAL.print(',');RF_SERIAL.print(gps.course,1);
+            RF_SERIAL.print(gps.lat,6); RF_SERIAL.print(','); RF_SERIAL.print(gps.lon,6); RF_SERIAL.print(',');
+            RF_SERIAL.print(gps.altitude,1); RF_SERIAL.print(','); RF_SERIAL.print(gps.speed,2); RF_SERIAL.print(','); RF_SERIAL.print(gps.course,1);
         } else {
             RF_SERIAL.print(F("N,N,N,N,N"));
         }
         RF_SERIAL.print(',');
-        RF_SERIAL.print(mad_roll,2);RF_SERIAL.print(',');RF_SERIAL.print(mad_pitch,2);RF_SERIAL.print(',');RF_SERIAL.print(mad_yaw,2);
-        RF_SERIAL.print(',');RF_SERIAL.print(altvel.rel_alt,2); 
-        RF_SERIAL.print(',');RF_SERIAL.print(altvel.vel,2);
-        RF_SERIAL.print(',');RF_SERIAL.print(altvel.g_force,3); 
-        RF_SERIAL.print(',');RF_SERIAL.print(altvel.dpdt,3);
-        RF_SERIAL.print(',');RF_SERIAL.print(rf_armed()?1:0); 
-        RF_SERIAL.print(',');RF_SERIAL.print((int)flight.state_code());
-        RF_SERIAL.print(',');RF_SERIAL.print(flight.throttle()); 
+        
+        RF_SERIAL.print(mad_roll,2); RF_SERIAL.print(','); RF_SERIAL.print(mad_pitch,2); RF_SERIAL.print(','); RF_SERIAL.print(mad_yaw,2);
+        RF_SERIAL.print(','); RF_SERIAL.print(altvel.rel_alt,2); 
+        RF_SERIAL.print(','); RF_SERIAL.print(altvel.vel,2);
+        RF_SERIAL.print(','); RF_SERIAL.print(altvel.g_force,3); 
+        RF_SERIAL.print(','); RF_SERIAL.print(altvel.dpdt,3);
+        RF_SERIAL.print(','); RF_SERIAL.print(rf_armed()?1:0); 
+        RF_SERIAL.print(','); RF_SERIAL.print((int)flight.state_code());
+        RF_SERIAL.print(','); RF_SERIAL.print(flight.throttle()); 
         RF_SERIAL.println();
     }
 }
