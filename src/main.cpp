@@ -689,7 +689,9 @@ static void aht20_read_finish(float&t,float&h){
 }
 
 static bool bno055_init(){
-    return bno.begin();
+    if(!bno.begin()) return false;
+    bno.setExtCrystalUse(true);   // xarici kristal (CLK_SRC=0x80) — VACIB
+    return true;
 }
 
 static void bno055_read_raw(float&ax,float&ay,float&az,float&gx,float&gy,float&gz,float&mx,float&my,float&mz){
