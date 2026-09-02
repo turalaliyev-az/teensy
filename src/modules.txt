@@ -1,0 +1,62 @@
+// ======================== ESC (50 Hz PWM — pin 15 + 23) ========================
+#define ESC1_PIN      15
+#define ESC2_PIN      23
+#define ESC_PWM_FREQ  50.0f
+#define ESC_US_MIN    1000
+#define ESC_US_MAX    2000
+#define ESC_US_OFF    1000
+#define ESC_US_RUN    1480
+static uint32_t us_to_duty(uint16_t us){if(us<ESC_US_MIN)us=ESC_US_MIN;if(us>ESC_US_MAX)us=ESC_US_MAX;return (uint32_t)us*65536UL/20000UL;}
+void esc_init(){pinMode(ESC1_PIN,OUTPUT);pinMode(ESC2_PIN,OUTPUT);analogWriteFrequency(ESC1_PIN,ESC_PWM_FREQ);analogWriteFrequency(ESC2_PIN,ESC_PWM_FREQ);analogWriteResolution(16);esc_write_us(ESC_US_OFF);}
+void esc_write_us(uint16_t us1,uint16_t us2){analogWrite(ESC1_PIN,us_to_duty(us1));analogWrite(ESC2_PIN,us_to_duty(us2));}
+void esc_write_us(uint16_t us){esc_write_us(us,us);}
+
+// ======================== RF KOMANDA ('1'=ARM, '0'=DISARM) ========================
+static bool _armed=false;static bool _last_ack=false;
+void rf_command_init(){_armed=false;_last_ack=false;}
+void rf_command_update(){while(Serial2.available()){char c=(char)Serial2.read();if(c=='1')_armed=true;else if(c=='0')_armed=false;else continue;if(_armed!=_last_ack){_last_ack=_armed;Serial2.print(_armed?'1':'0');Serial2.print('\n');}}}
+bool rf_armed(){return _armed;}
+
+// ======================== HUNDURLUK + SURET (IMU + BARO) ========================
+struct AltVel {
+    float rel_alt,vel,g_force,dpdt;
+    void init();
+    void update(float pressure_hpa,float az_mps2,float ax_mps2,float ay_mps2);
+    bool calibrated() const { return _calibrated; }
+private:
+    float _p0,_p_smooth,_prev_p,_dpdt_smooth,_a_smooth,_g_smooth;
+    uint32_t _last_us; bool _have_prev;
+    float _P00,_P01,_P11;
+    uint32_t _calib_start_ms; float _calib_sum; uint32_t _calib_count; bool _calibrated;
+};
+#define GRAVITY 9.80665f
+#define CALIB_MS 2000UL
+#define CALIB_MIN_N 10
+#define P_ALPHA 0.30f
+#define DPDT_ALPHA 0.25f
+#define A_ALPHA 0.25f
+#define G_ALPHA 0.15f
+#define Q_ALT 0.05f
+#define Q_VEL 0.6f
+#define R_ALT 1.0f
+void AltVel::init(){rel_alt=0.0f;vel=0.0f;g_force=0.0f;dpdt=0.0f;_p0=1013.25f;_p_smooth=0.0f;_prev_p=0.0f;_dpdt_smooth=0.0f;_a_smooth=0.0f;_g_smooth=0.0f;_last_us=0;_have_prev=false;_P00=1.0f;_P01=0.0f;_P11=1.0f;_calib_start_ms=0;_calib_sum=0.0f;_calib_count=0;_calibrated=false;}
+void AltVel::update(float pressure_hpa,float az,float ax,float ay){uint32_t now_us=micros();float dt=0.0f;if(_last_us!=0){dt=(float)(now_us-_last_us)*1.0e-6f;if(dt<0.0f)dt=0.0f;if(dt>0.5f)dt=0.5f;}_last_us=now_us;float g_raw=sqrtf(ax*ax+ay*ay+az*az)/GRAVITY;if(_g_smooth<=0.0f)_g_smooth=g_raw;else _g_smooth+=G_ALPHA*(g_raw-_g_smooth);g_force=_g_smooth;if(!_have_prev){_p_smooth=pressure_hpa;_prev_p=pressure_hpa;_have_prev=true;}else _p_smooth+=P_ALPHA*(pressure_hpa-_p_smooth);if(dt>1.0e-4f){float raw=(_p_smooth-_prev_p)/dt;_dpdt_smooth+=DPDT_ALPHA*(raw-_dpdt_smooth);}_prev_p=_p_smooth;dpdt=_dpdt_smooth;if(!_calibrated){if(_calib_start_ms==0)_calib_start_ms=millis();_calib_sum+=pressure_hpa;_calib_count++;rel_alt=0.0f;vel=0.0f;if(millis()-_calib_start_ms>=CALIB_MS&&_calib_count>=CALIB_MIN_N){_p0=_calib_sum/(float)_calib_count;_p_smooth=_p0;_prev_p=_p0;_calibrated=true;}return;}float z=0.0f;if(_p0>1.0f)z=44330.0f*(1.0f-powf(_p_smooth/_p0,0.1903f));float a_vert=az-GRAVITY;_a_smooth+=A_ALPHA*(a_vert-_a_smooth);float alt_p=rel_alt+vel*dt+0.5f*_a_smooth*dt*dt;float vel_p=vel+_a_smooth*dt;float P00_p=_P00+2.0f*dt*_P01+dt*dt*_P11+Q_ALT;float P01_p=_P01+dt*_P11;float P11_p=_P11+Q_VEL;float S=P00_p+R_ALT;float K0=P00_p/S;float K1=P01_p/S;float innov=z-alt_p;rel_alt=alt_p+K0*innov;vel=vel_p+K1*innov;_P00=(1.0f-K0)*P00_p;_P01=(1.0f-K0)*P01_p;_P11=P11_p-K1*P01_p;}
+
+// ======================== UCUSH NEZARETI ========================
+enum FlightState:uint8_t{FS_DISARMED=0,FS_ARMED=1,FS_MOTORS_ON=2};
+struct FlightCtrl {
+    FlightState state; float throttle_us;
+    void init();
+    void update(bool armed,bool level_ok,bool descending,float rel_alt,uint32_t now_ms);
+    uint16_t throttle() const{return (uint16_t)throttle_us;}
+    uint8_t state_code() const{return (uint8_t)state;}
+private:
+    uint32_t _last_ms;
+};
+#define ALT_TRIGGER_M 500.0f
+#define RAMP_MS 500UL
+#define RAMP_STEP_US ((float)(ESC_US_RUN-ESC_US_OFF)/(float)RAMP_MS)
+void FlightCtrl::init(){state=FS_DISARMED;throttle_us=(float)ESC_US_OFF;_last_ms=0;}
+void FlightCtrl::update(bool armed,bool level_ok,bool descending,float rel_alt,uint32_t now_ms){uint32_t dt_ms=0;if(_last_ms!=0){dt_ms=now_ms-_last_ms;if(dt_ms>100)dt_ms=100;}_last_ms=now_ms;if(!armed){state=FS_DISARMED;throttle_us=(float)ESC_US_OFF;esc_write_us((uint16_t)throttle_us);return;}switch(state){case FS_DISARMED:throttle_us=(float)ESC_US_OFF;state=FS_ARMED;break;case FS_ARMED:if(level_ok&&descending&&rel_alt<=ALT_TRIGGER_M)state=FS_MOTORS_ON;break;case FS_MOTORS_ON:if(!level_ok)break;if(throttle_us<(float)ESC_US_RUN){throttle_us+=RAMP_STEP_US*(float)dt_ms;if(throttle_us>(float)ESC_US_RUN)throttle_us=(float)ESC_US_RUN;}break;}esc_write_us((uint16_t)throttle_us);}
+
+// ====EKF====
