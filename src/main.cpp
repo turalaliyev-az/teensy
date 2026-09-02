@@ -7,13 +7,11 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_AHTX0.h>
 
-// ======================== SENSOR OBYEKTLERI ========================
-// BNO055: Sensor ID=55, Unvan=0x28, Wire obyekti
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 Adafruit_BME280 bme;
 Adafruit_AHTX0 aht;
 
-// ======================== ESC (50 Hz PWM) ========================
+// ======================== ESC ========================
 #define ESC1_PIN      15      
 #define ESC2_PIN      23      
 #define ESC_PWM_FREQ  50.0f
@@ -50,7 +48,7 @@ void esc_write_us(uint16_t us) {
     esc_write_us(us, us);
 }
 
-// ======================== RF EMRLERİ ========================
+// ======================== RF EMRLERİ (Ehtiyat kilidi) ========================
 static bool _armed = false;
 static bool _last_ack = false;   
 
@@ -78,7 +76,7 @@ bool rf_armed() {
     return _armed;
 }
 
-// ======================== HUNDURLUK + SURET (IMU + BARO fusion) ========================
+// ======================== HUNDURLUK + SURET ========================
 struct AltVel {
     float rel_alt;    
     float vel;        
@@ -86,7 +84,7 @@ struct AltVel {
     float dpdt;       
 
     void init();
-    void update(float pressure_hpa, float az_mps2, float ax_mps2, float ay_mps2);
+    void update(float pressure_hpa, float az_mps2, float ax_mps2, float ay_mps2, bool imu_ok);
     bool calibrated() const { return _calibrated; }
 
 private:
@@ -108,8 +106,8 @@ private:
 };
 
 #define GRAVITY      9.80665f
-#define CALIB_MS     2000UL
-#define CALIB_MIN_N  10
+#define CALIB_MS     2500UL   // Kalibrasiya muddeti (2.5 saniye)
+#define CALIB_MIN_N  15
 #define P_ALPHA      0.30f   
 #define DPDT_ALPHA   0.25f   
 #define A_ALPHA      0.25f   
@@ -126,7 +124,7 @@ void AltVel::init() {
     _calib_start_ms = 0; _calib_sum = 0.0f; _calib_count = 0; _calibrated = false;
 }
 
-void AltVel::update(float pressure_hpa, float az, float ax, float ay) {
+void AltVel::update(float pressure_hpa, float az, float ax, float ay, bool imu_ok) {
     uint32_t now_us = micros();
     float dt = 0.0f;
     if (_last_us != 0) {
@@ -136,7 +134,14 @@ void AltVel::update(float pressure_hpa, float az, float ax, float ay) {
     }
     _last_us = now_us;
 
-    float g_raw = sqrtf(ax*ax + ay*ay + az*az) / GRAVITY;
+    // G-quvvesi
+    float g_raw;
+    if (imu_ok) {
+        g_raw = sqrtf(ax*ax + ay*ay + az*az) / GRAVITY;
+    } else {
+        g_raw = 1.0f;
+    }
+    
     if (_g_smooth <= 0.0f) {
         _g_smooth = g_raw;
     } else {
@@ -144,12 +149,16 @@ void AltVel::update(float pressure_hpa, float az, float ax, float ay) {
     }
     g_force = _g_smooth;
 
+    // Tezyiq filtri
     if (!_have_prev) {
-        _p_smooth = pressure_hpa; _prev_p = pressure_hpa; _have_prev = true;
+        _p_smooth = pressure_hpa;
+        _prev_p = pressure_hpa;
+        _have_prev = true;
     } else {
         _p_smooth += P_ALPHA * (pressure_hpa - _p_smooth);
     }
 
+    // dP/dt
     if (dt > 1.0e-4f) {
         float raw = (_p_smooth - _prev_p) / dt;
         _dpdt_smooth += DPDT_ALPHA * (raw - _dpdt_smooth);
@@ -157,32 +166,48 @@ void AltVel::update(float pressure_hpa, float az, float ax, float ay) {
     _prev_p = _p_smooth;
     dpdt = _dpdt_smooth;
 
+    // Boot kalibrasiyasi (yalniz baslangicda)
     if (!_calibrated) {
         if (_calib_start_ms == 0) _calib_start_ms = millis();
         _calib_sum += pressure_hpa;
         _calib_count++;
-        rel_alt = 0.0f; vel = 0.0f;
+        rel_alt = 0.0f; 
+        vel = 0.0f;
         if (millis() - _calib_start_ms >= CALIB_MS && _calib_count >= CALIB_MIN_N) {
             _p0 = _calib_sum / (float)_calib_count;
-            _p_smooth = _p0; _prev_p = _p0; _calibrated = true;
+            _p_smooth = _p0; 
+            _prev_p = _p0; 
+            _calibrated = true;
+            Serial.print(F("[ALT] Kalibrasiya tamam: P0="));
+            Serial.print(_p0, 2);
+            Serial.println(F(" hPa"));
         }
         return;
     }
 
+    // Barometrik hunderluk
     float z = 0.0f;
     if (_p0 > 1.0f) {
         z = 44330.0f * (1.0f - powf(_p_smooth / _p0, 0.1903f));
     }
 
-    float a_vert = az - GRAVITY;
+    // IMU suratlendirmesi
+    float a_vert;
+    if (imu_ok) {
+        a_vert = az - GRAVITY;
+    } else {
+        a_vert = 0.0f;  // IMU yoxdursa, suratlendirmeni 0 qebul et
+    }
     _a_smooth += A_ALPHA * (a_vert - _a_smooth);
 
+    // Kalman proqnozu
     float alt_p = rel_alt + vel*dt + 0.5f*_a_smooth*dt*dt;
     float vel_p = vel + _a_smooth*dt;
     float P00_p = _P00 + 2.0f*dt*_P01 + dt*dt*_P11 + Q_ALT;
     float P01_p = _P01 + dt*_P11;
     float P11_p = _P11 + Q_VEL;
 
+    // Yenileme (baro olcmesi ile)
     float S = P00_p + R_ALT;
     float K0 = P00_p / S;
     float K1 = P01_p / S;
@@ -214,7 +239,7 @@ private:
 
 #define ALT_TRIGGER_M   500.0f
 #define RAMP_MS         500UL
-#define RAMP_STEP_US    ((float)(ESC_US_RUN - ESC_US_OFF) / (float)RAMP_MS)  
+#define RAMP_STEP_US    ((float)(ESC_US_RUN - ESC_US_OFF) / (float)RAMP_MS)
 
 void FlightCtrl::init() {
     state = FS_DISARMED;
@@ -226,10 +251,11 @@ void FlightCtrl::update(bool armed, bool level_ok, bool descending, float rel_al
     uint32_t dt_ms = 0;
     if (_last_ms != 0) {
         dt_ms = now_ms - _last_ms;
-        if (dt_ms > 100) dt_ms = 100;   
+        if (dt_ms > 100) dt_ms = 100;
     }
     _last_ms = now_ms;
 
+    // DISARM = EHTIYAT KILIDI: Motorlar hec vaxt islemir
     if (!armed) {
         state = FS_DISARMED;
         throttle_us = (float)ESC_US_OFF;
@@ -237,23 +263,36 @@ void FlightCtrl::update(bool armed, bool level_ok, bool descending, float rel_al
         return;
     }
 
-    switch (state) {
-    case FS_DISARMED:
-        throttle_us = (float)ESC_US_OFF;
+    // ARM = ICAZE: Sistem avtomatik islemeye hazirdir
+    if (state == FS_DISARMED) {
         state = FS_ARMED;
-        break;
-    case FS_ARMED:
-        if (level_ok && descending && rel_alt <= ALT_TRIGGER_M) {
+        throttle_us = (float)ESC_US_OFF;
+        // Hunderluk sifirlanmir - sadece icaze verilir
+    }
+
+    if (state == FS_ARMED) {
+        // Avtomatik ise dusme sertleri:
+        // 1. level_ok (+-5 derece)
+        // 2. descending (asagi duser)
+        // 3. alt <= 500m
+        if (level_ok && descending && (rel_alt <= ALT_TRIGGER_M)) {
             state = FS_MOTORS_ON;
         }
-        break;
-    case FS_MOTORS_ON:
-        if (!level_ok) break;
+    }
+
+    if (state == FS_MOTORS_ON) {
+        if (!level_ok) {
+            esc_write_us((uint16_t)throttle_us);
+            return; 
+        }
+        
+        // Pille-pille artma: 1000 -> 1480, 500ms
         if (throttle_us < (float)ESC_US_RUN) {
             throttle_us += RAMP_STEP_US * (float)dt_ms;
-            if (throttle_us > (float)ESC_US_RUN) throttle_us = (float)ESC_US_RUN;
+            if (throttle_us > (float)ESC_US_RUN) {
+                throttle_us = (float)ESC_US_RUN;
+            }
         }
-        break;
     }
     esc_write_us((uint16_t)throttle_us);
 }
@@ -498,7 +537,7 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define FLIGHT_PERIOD   10    
 #define SEA_LEVEL_HPA   1013.25f
 
-// ======================== GPS NMEA PARSER ========================
+// ======================== GPS ========================
 static float nmea_to_decimal(float ddmm) {
     int deg = (int)(ddmm / 100.0f); 
     float min = ddmm - (float)(deg * 100);
@@ -562,7 +601,7 @@ static void gps_read(){
     }
 }
 
-// ======================== KALMAN VƏ STATUS ========================
+// ======================== KALMAN ========================
 struct Kalman1D {
     float Q,R,P,K,X;
     void init(float q,float r,float x0){Q=q;R=r;P=1;K=0;X=x0;}
@@ -590,6 +629,8 @@ void setup(){
     Serial.begin(115200);
     delay(200);
     Serial.println(F("\n=== TEENSY 4.1 " DEVICE_NAME " ==="));
+    Serial.println(F("[REJIM] AVTOMATIK: 500m/Enish/+-5Derece -> ESC 1480us"));
+    Serial.println(F("[RF] ARM/DISARM = Ehtiyat kilidi (sistem avtomatik isleyir)"));
     rf_command_init(); 
     altvel.init(); 
     flight.init();
@@ -598,14 +639,12 @@ void setup(){
     Wire.begin();
     Wire.setClock(I2C_FREQ);
     
-    // BNO055 Init
     Serial.print(F("BNO055: "));
     if(!bno.begin()) {
-        Serial.println(F("FAIL (Check Wiring)"));
+        Serial.println(F("FAIL"));
         ok.bno055 = false;
     } else {
         ok.bno055 = true;
-        // Klonlarda xarici kristal olmaya biler, ona gore false edirik
         bno.setExtCrystalUse(false); 
         delay(100);
         uint8_t sys, gyro, accel, mag;
@@ -614,17 +653,16 @@ void setup(){
         Serial.print(gyro); Serial.print('/'); Serial.print(accel); Serial.print('/'); Serial.print(mag); Serial.println(F(")"));
     }
 
-    // BME280 Init
     Serial.print(F("BME280: "));
     if (!bme.begin(0x76, &Wire)) {
-        Serial.println(F("FAIL (Check Address/Wiring)"));
+        Serial.println(F("FAIL"));
         ok.bme280 = false;
     } else {
         ok.bme280 = true;
         bme.setSampling(Adafruit_BME280::MODE_NORMAL,
-                        Adafruit_BME280::SAMPLING_X2,  // Temp
-                        Adafruit_BME280::SAMPLING_X16, // Pressure
-                        Adafruit_BME280::SAMPLING_X1,  // Humidity
+                        Adafruit_BME280::SAMPLING_X2,
+                        Adafruit_BME280::SAMPLING_X16,
+                        Adafruit_BME280::SAMPLING_X1,
                         Adafruit_BME280::FILTER_X16,
                         Adafruit_BME280::STANDBY_MS_0_5);
         Serial.println(F("25 Hz OK"));
@@ -634,7 +672,6 @@ void setup(){
         kalmanAlt.init(0.01f, 2.0f, bme_a);
     }
 
-    // AHT20 Init
     Serial.print(F("AHT20:  "));
     if (!aht.begin()) {
         Serial.println(F("FAIL/OFF"));
@@ -646,11 +683,9 @@ void setup(){
     aht_t = 0.0f; 
     aht_h = 0.0f; 
 
-    // GPS Init
     GPS_SERIAL.begin(GPS_BAUD);
     Serial.print(F("GPS:    Serial7 @ ")); Serial.print(GPS_BAUD); Serial.println(F(" baud"));
     
-    // EKF Init (Sabit durduqda Z oxu 9.81 m/s^2 olmalidir)
     ekf.init(0.0f, 0.0f, 9.80665f);
     Serial.println(F("[FILTER] Attitude EKF initialized"));
     
@@ -670,17 +705,15 @@ void loop(){
     // Ucus Nezaretcisi (100 Hz)
     if(now-lastFlight>=FLIGHT_PERIOD){
         lastFlight=now;
-        static bool wasLevel=false;
         float tilt=fmaxf(fabsf(mad_roll),fabsf(mad_pitch));
-        bool level = wasLevel ? (tilt<=8.0f) : (tilt<=5.0f);
+        bool level_ok = (tilt <= 5.0f);
+        
         if(!ok.bno055){
-            level=false;
-            wasLevel=false;
-        } else {
-            wasLevel=level;
+            level_ok=false;
         }
+        
         bool descending = (altvel.vel < 0.0f);
-        flight.update(rf_armed(), level, descending, altvel.rel_alt, now);
+        flight.update(rf_armed(), level_ok, descending, altvel.rel_alt, now);
     }
 
     // IMU / BNO055 (100 Hz)
@@ -688,7 +721,6 @@ void loop(){
         lastBno=now;
         if(ok.bno055){
             sensors_event_t event;
-            // Kitabxana avtomatik olaraq m/s^2 ve rad/s qaytarir
             bno.getEvent(&event, Adafruit_BNO055::VECTOR_ACCELEROMETER);
             ax = event.acceleration.x;
             ay = event.acceleration.y;
@@ -715,15 +747,15 @@ void loop(){
         lastBme=now;
         if(ok.bme280){
             bme_t = bme.readTemperature();
-            bme_p = bme.readPressure() / 100.0f; // Pa -> hPa
+            bme_p = bme.readPressure() / 100.0f;
             bme_h = bme.readHumidity();
             bme_a = bme.readAltitude(SEA_LEVEL_HPA);
             
             bme_tk = kalmanTemp.update(bme_t);
             bme_ak = kalmanAlt.update(bme_a); 
             
-            // Hundurluk ve Suret sensoru (AltVel) yenilenir
-            altvel.update(bme_p, az, ax, ay);
+            // IMU olmadıqda hunderluk pozulmasın deye imu_ok flag-i gonderilir
+            altvel.update(bme_p, az, ax, ay, ok.bno055);
         }
     }
     
@@ -736,7 +768,7 @@ void loop(){
         aht_h = humidity.relative_humidity;
     }
     
-    // GPS (Oxunma)
+    // GPS
     gps_read();
     if(now-lastGps>=GPS_PERIOD){
         lastGps=now;
@@ -776,8 +808,8 @@ void loop(){
         Serial.print(F(" | FLT:"));
         Serial.print(rf_armed()?F("ARM"):F("DISARM")); 
         Serial.print('/'); Serial.print((int)flight.state_code());
-        Serial.print(F(" alt=")); Serial.print(altvel.rel_alt,1); 
-        Serial.print(F(" vel=")); Serial.print(altvel.vel,1);
+        Serial.print(F(" alt=")); Serial.print(altvel.rel_alt,2); 
+        Serial.print(F(" vel=")); Serial.print(altvel.vel,2);
         Serial.print(F(" g=")); Serial.print(altvel.g_force,2); 
         Serial.print(F(" pwm=")); Serial.print(flight.throttle()); 
         Serial.println();
