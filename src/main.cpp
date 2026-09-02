@@ -12,8 +12,8 @@
  *
  * Filtrler:
  *   1D Kalman     — BME280 temperatur + yukseklik
- *   Madgwick AHRS — 6-DOF (raw accel+gyro)
- *   BNO055 NDOF   — daxili 9-DOF Kalman fusion
+ *   Attitude EKF  — 7-dovletli quaternion (gyro+accel, yaw-suz)
+ *   BNO055 LPF    — daxili hardware low-pass (page 1)
  *   BME280 IIR x16 — daxili hardware filtr
  *
  * Paket formati (15 Hz):
@@ -29,6 +29,12 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
+
+#include "esc.h"
+#include "rf_command.h"
+#include "alt_vel.h"
+#include "flight_ctrl.h"
+#include "attitude_ekf.h"
 
 // ======================== CIHAZ BASLIGI VE ADI ========================
 #if DEVICE_TYPE == 2
@@ -61,6 +67,7 @@
 #define GPS_PERIOD      200   // 5 Hz
 #define PRINT_PERIOD    200   // USB 5 Hz
 #define RF_PERIOD       66    // RF 15 Hz
+#define FLIGHT_PERIOD   10    // 100 Hz ucush nezareti (yalniz CC)
 
 // ======================== BNO055 REGISTERLERI ========================
 #define BNO055_CHIP_ID      0x00
@@ -72,6 +79,9 @@
 #define BNO055_ACC_START    0x08
 #define BNO055_MAG_START    0x0E
 #define BNO055_GYRO_START   0x14
+#define BNO055_PAGE_ID      0x07
+#define BNO055_ACC_CFG      0x08   // page 1: akseleorometr konfigurasiyasi
+#define BNO055_GYR_CFG0     0x0A   // page 1: giroskop konfigurasiyasi
 
 // ======================== BME280 REGISTER ========================
 #define BME280_CHIP_ID      0xD0
@@ -114,33 +124,8 @@ static GPSData gps;
 static char gps_buf[128];
 static uint8_t gps_idx = 0;
 
-// ======================== MADGWICK AHRS (6-DOF) ========================
-struct MadgwickAHRS {
-    float q[4], beta, dt;
-    void init(float freq, float b) { q[0]=1; q[1]=q[2]=q[3]=0; dt=1.0f/freq; beta=b; }
-    void update(float gx,float gy,float gz,float ax,float ay,float az){
-        float nr=1.0f/sqrtf(ax*ax+ay*ay+az*az); ax*=nr;ay*=nr;az*=nr;
-        float _2q0=2*q[0],_2q1=2*q[1],_2q2=2*q[2],_2q3=2*q[3];
-        float _4q0=4*q[0],_4q1=4*q[1],_4q2=4*q[2],_8q1=8*q[1],_8q2=8*q[2];
-        float q0q0=q[0]*q[0],q1q1=q[1]*q[1],q2q2=q[2]*q[2],q3q3=q[3]*q[3];
-        float s0=_4q0*q2q2+_2q2*ax+_4q0*q1q1-_2q1*ay;
-        float s1=_4q1*q3q3-_2q3*ax+4*q0q0*q[1]-_2q0*ay-_4q1+_8q1*q1q1+_8q1*q2q2+_4q1*az;
-        float s2=4*q0q0*q[2]+_2q0*ax+_4q2*q3q3-_2q3*ay-_4q2+_8q2*q1q1+_8q2*q2q2+_4q2*az;
-        float s3=4*q1q1*q[3]-_2q1*ax+4*q2q2*q[3]-_2q2*ay;
-        nr=1.0f/sqrtf(s0*s0+s1*s1+s2*s2+s3*s3); s0*=nr;s1*=nr;s2*=nr;s3*=nr;
-        float qd0=0.5f*(-q[1]*gx-q[2]*gy-q[3]*gz)-beta*s0;
-        float qd1=0.5f*(q[0]*gx+q[2]*gz-q[3]*gy)-beta*s1;
-        float qd2=0.5f*(q[0]*gy-q[1]*gz+q[3]*gx)-beta*s2;
-        float qd3=0.5f*(q[0]*gz+q[1]*gy-q[2]*gx)-beta*s3;
-        q[0]+=qd0*dt;q[1]+=qd1*dt;q[2]+=qd2*dt;q[3]+=qd3*dt;
-        nr=1.0f/sqrtf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);q[0]*=nr;q[1]*=nr;q[2]*=nr;q[3]*=nr;
-    }
-    void getEulerDeg(float&r,float&p,float&y){
-        r=atan2f(q[0]*q[1]+q[2]*q[3],0.5f-q[1]*q[1]-q[2]*q[2])*57.29578f;
-        p=asinf(-2*(q[1]*q[3]-q[0]*q[2]))*57.29578f;
-        y=atan2f(q[1]*q[2]+q[0]*q[3],0.5f-q[2]*q[2]-q[3]*q[3])*57.29578f;
-    }
-};
+// ======================== ATTITUDE EKF (7-DOVLETLI) ========================
+// attitude_ekf.h/.cpp modulundadir — Madgwick evezine tam Kalman (yaw-suz)
 
 // ======================== KALMAN ========================
 struct Kalman1D {
@@ -157,10 +142,15 @@ static int32_t t_fine;
 
 // ======================== GLOBAL STATUS ========================
 static struct{uint8_t bno055:1,bme280:1,aht20:1,gps_fix:1;} ok;
-static MadgwickAHRS madgwick;
+static AttitudeEKF ekf;
 static Kalman1D kalmanTemp,kalmanAlt;
 static bool kalman_ready=false,aht_triggered=false;
 static uint32_t aht_trigger_ms=0,lastBno,lastBme,lastAht,lastGps,lastPrn,lastRf;
+#if DEVICE_TYPE == 3
+static uint32_t lastFlight;
+static AltVel altvel;
+static FlightCtrl flight;
+#endif
 
 // Sensor data buferi
 static float ax,ay,az,gx,gy,gz,mx,my,mz;
@@ -243,7 +233,20 @@ static void aht20_trigger(){Wire.beginTransmission(AHT20_ADDR);Wire.write(AHT20_
 static void aht20_read_finish(float&t,float&h){if(!aht_triggered)return;if(millis()-aht_trigger_ms<80)return;uint8_t buf[7];rBuf(AHT20_ADDR,0x00,buf,7);aht_triggered=false;if(buf[0]&AHT20_STAT_BUSY){t=NAN;h=NAN;return;}uint32_t rh=((uint32_t)buf[1]<<12)|((uint32_t)buf[2]<<4)|(buf[3]>>4);uint32_t rt=(((uint32_t)buf[3]&0x0F)<<16)|((uint32_t)buf[4]<<8)|buf[5];h=(float)rh*9.5367431640625e-5f;t=(float)rt*1.9073486328125e-4f-50.0f;}
 
 // ======================== BNO055 ========================
-static bool bno055_init(){if(r8(BNO055_ADDR,BNO055_CHIP_ID)!=0xA0)return false;w8(BNO055_ADDR,BNO055_OPR_MODE,0x00);delay(30);w8(BNO055_ADDR,BNO055_PWR_MODE,0x00);delay(10);w8(BNO055_ADDR,BNO055_UNIT_SEL,0x80);w8(BNO055_ADDR,BNO055_SYS_TRIG,0x80);delay(50);w8(BNO055_ADDR,BNO055_OPR_MODE,0x0C);delay(200);return true;}
+static bool bno055_init(){
+    if(r8(BNO055_ADDR,BNO055_CHIP_ID)!=0xA0)return false;
+    w8(BNO055_ADDR,BNO055_OPR_MODE,0x00);delay(30);
+    w8(BNO055_ADDR,BNO055_PWR_MODE,0x00);delay(10);
+    w8(BNO055_ADDR,BNO055_UNIT_SEL,0x80);
+    // page 1: hardware low-pass + range (vibrasiya kesimi)
+    w8(BNO055_ADDR,BNO055_PAGE_ID,0x01);
+    w8(BNO055_ADDR,BNO055_ACC_CFG,0x0C);   // acc_bw 62.5Hz, range +-2g (0.01 m/s2/LSB)
+    w8(BNO055_ADDR,BNO055_GYR_CFG0,0x38);  // gyr_bw 32Hz, range 2000dps
+    w8(BNO055_ADDR,BNO055_PAGE_ID,0x00);
+    w8(BNO055_ADDR,BNO055_SYS_TRIG,0x80);delay(50);
+    w8(BNO055_ADDR,BNO055_OPR_MODE,0x0C);delay(200);
+    return true;
+}
 static void bno055_read_raw(float&ax,float&ay,float&az,float&gx,float&gy,float&gz,float&mx,float&my,float&mz){
     uint8_t buf[6];
     rBuf(BNO055_ADDR,BNO055_ACC_START,buf,6);ax=(int16_t)((buf[1]<<8)|buf[0])*BNO055_ACC_SCALE;ay=(int16_t)((buf[3]<<8)|buf[2])*BNO055_ACC_SCALE;az=(int16_t)((buf[5]<<8)|buf[4])*BNO055_ACC_SCALE;
@@ -257,11 +260,22 @@ static void i2c_scan(){Serial.println(F("--- I2C Scan ---"));uint8_t cnt=0;for(u
 // ======================== SETUP ========================
 void setup(){
     pinMode(LED_PIN,OUTPUT);digitalWrite(LED_PIN,HIGH);
+#if DEVICE_TYPE == 3
+    esc_init();   // ESC-ler guc acilanda derhal 1000 us alir (tehlukesizlik)
+#endif
     Serial.begin(115200);delay(200);
 
     Serial.println(F("\n=== TEENSY 4.1 " DEVICE_NAME " ==="));
     Serial.println(F("  IMU: AX,AY,AZ,GX,GY,GZ,MX,MY,MZ"));
-    Serial.println(F("  BME280 + AHT20 + GPS + Kalman + Madgwick\n"));
+    Serial.println(F("  BME280 + AHT20 + GPS + Kalman + Attitude EKF\n"));
+
+#if DEVICE_TYPE == 3
+    rf_command_init();
+    altvel.init();
+    flight.init();
+    Serial.println(F("[ESC] 50 Hz PWM: pin 15 + 23 (1000..2000 us)"));
+    Serial.println(F("[RF-CMD] RX: '1'=ARM, '0'=DISARM"));
+#endif
 
     Wire.begin();Wire.setClock(I2C_FREQ);
     Serial.print(F("[I2C] "));Serial.print(I2C_FREQ/1000);Serial.println(F(" kHz"));
@@ -286,8 +300,8 @@ void setup(){
     GPS_SERIAL.begin(GPS_BAUD);
     Serial.print(F("GPS:    Serial7 @ "));Serial.print(GPS_BAUD);Serial.println(F(" baud"));
 
-    madgwick.init(200.0f,0.03f);
-    Serial.println(F("[FILTER] Madgwick AHRS: 200 Hz beta=0.03"));
+    ekf.init(0.0f, 0.0f, 9.80665f);
+    Serial.println(F("[FILTER] Attitude EKF: 7-state quaternion (gyro+accel), 100 Hz"));
 
     RF_SERIAL.begin(RF_BAUD);
     Serial.print(F("[RF] Serial2 @ "));Serial.print(RF_BAUD);Serial.print(F(" baud, Header: "));
@@ -296,6 +310,9 @@ void setup(){
 
     uint32_t now=millis();
     lastBno=lastBme=lastAht=lastGps=lastPrn=lastRf=now;
+#if DEVICE_TYPE == 3
+    lastFlight=now;
+#endif
     digitalWrite(LED_PIN,LOW);
 }
 
@@ -303,11 +320,30 @@ void setup(){
 void loop(){
     uint32_t now=millis();
 
+#if DEVICE_TYPE == 3
+    rf_command_update();
+
+    if(now-lastFlight>=FLIGHT_PERIOD){lastFlight=now;
+        static bool wasLevel=false;
+        float tilt=fmaxf(fabsf(mad_roll),fabsf(mad_pitch));
+        bool level;
+        if(wasLevel) level=(tilt<=8.0f);
+        else         level=(tilt<=5.0f);
+        if(!ok.bno055){level=false;wasLevel=false;} else wasLevel=level;
+        bool descending = (altvel.vel < 0.0f);
+        flight.update(rf_armed(), level, descending, altvel.rel_alt, now);
+    }
+#endif
+
     if(now-lastBno>=BNO055_PERIOD){lastBno=now;
-        if(ok.bno055){bno055_read_raw(ax,ay,az,gx,gy,gz,mx,my,mz);madgwick.update(gx,gy,gz,ax,ay,az);madgwick.getEulerDeg(mad_roll,mad_pitch,mad_yaw);}
+        if(ok.bno055){bno055_read_raw(ax,ay,az,gx,gy,gz,mx,my,mz);ekf.predict(gx,gy,gz,0.01f);ekf.update(ax,ay,az);ekf.getEulerDeg(mad_roll,mad_pitch,mad_yaw);}
     }
     if(now-lastBme>=BME280_PERIOD){lastBme=now;
-        if(ok.bme280){bme280_read(bme_t,bme_p,bme_h,bme_a);bme_tk=kalmanTemp.update(bme_t);bme_ak=kalmanAlt.update(bme_a);}
+        if(ok.bme280){bme280_read(bme_t,bme_p,bme_h,bme_a);bme_tk=kalmanTemp.update(bme_t);bme_ak=kalmanAlt.update(bme_a);
+#if DEVICE_TYPE == 3
+            altvel.update(bme_p, az, ax, ay);
+#endif
+        }
     }
     if(ok.aht20&&now-lastAht>=AHT20_PERIOD){lastAht=now;if(aht_triggered)aht20_read_finish(aht_t,aht_h);aht20_trigger();}
     gps_read();if(now-lastGps>=GPS_PERIOD){lastGps=now;ok.gps_fix=(gps.fix>0);}
@@ -321,6 +357,14 @@ void loop(){
         Serial.print(F(" | T:"));if(ok.bme280){Serial.print(bme_tk,1);Serial.print('/');Serial.print(bme_ak,1);}else Serial.print(F("OFF"));
         Serial.print(F(" | A:"));if(ok.aht20){Serial.print(aht_t,1);Serial.print('/');Serial.print(aht_h,1);}else Serial.print(F("OFF"));
         Serial.print(F(" | GPS:"));if(ok.gps_fix){Serial.print(gps.lat,5);Serial.print(',');Serial.print(gps.lon,5);}else Serial.print(F("NO"));
+#if DEVICE_TYPE == 3
+        Serial.print(F(" | FLT:"));Serial.print(rf_armed()?F("ARM"):F("DISARM"));
+        Serial.print('/');Serial.print((int)flight.state_code());
+        Serial.print(F(" alt="));Serial.print(altvel.rel_alt,1);
+        Serial.print(F(" vel="));Serial.print(altvel.vel,1);
+        Serial.print(F(" g="));Serial.print(altvel.g_force,2);
+        Serial.print(F(" pwm="));Serial.print(flight.throttle());
+#endif
         Serial.println();
     }
 
@@ -342,6 +386,15 @@ void loop(){
         else RF_SERIAL.print(F("N,N,N,N,N"));
         RF_SERIAL.print(',');
         RF_SERIAL.print(mad_roll,2);RF_SERIAL.print(',');RF_SERIAL.print(mad_pitch,2);RF_SERIAL.print(',');RF_SERIAL.print(mad_yaw,2);
+#if DEVICE_TYPE == 3
+        RF_SERIAL.print(',');RF_SERIAL.print(altvel.rel_alt,2);
+        RF_SERIAL.print(',');RF_SERIAL.print(altvel.vel,2);
+        RF_SERIAL.print(',');RF_SERIAL.print(altvel.g_force,3);
+        RF_SERIAL.print(',');RF_SERIAL.print(altvel.dpdt,3);
+        RF_SERIAL.print(',');RF_SERIAL.print(rf_armed()?1:0);
+        RF_SERIAL.print(',');RF_SERIAL.print((int)flight.state_code());
+        RF_SERIAL.print(',');RF_SERIAL.print(flight.throttle());
+#endif
         RF_SERIAL.println();
     }
 }
