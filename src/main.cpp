@@ -1,30 +1,19 @@
 /**
- * @file main.cpp — Payload (BB) / Drone (CC)
+ * @file main.cpp — Drone (CC)
  *
  * Teensy 4.1 (Cortex-M7, 600MHz, Hardware FPU) — 0 XARICI KITABXANA
  *
- * Bolme secimi (compile-time):
- *   DEVICE_TYPE=2 → BB Payload (default)
- *   DEVICE_TYPE=3 → CC Drone
- *
  * Sensorlar:   BNO055(0x28) + BME280(0x76) + AHT20(0x38) + GPS(Serial7)
- * RF:          Serial2 (TX=7,RX=8) @ 115200 baud, 15 Hz CSV
+ * RF:          Serial2 (TX=7,RX=8) @ 115200 baud, 15 Hz CSV + komanda RX
  *
  * Filtrler:
  *   1D Kalman     — BME280 temperatur + yukseklik
  *   Attitude EKF  — 7-dovletli quaternion (gyro+accel, yaw-suz)
- *   BNO055 LPF    — daxili hardware low-pass (page 1)
  *   BME280 IIR x16 — daxili hardware filtr
  *
  * Paket formati (15 Hz):
- *   BB,ts,AX,AY,AZ,GX,GY,GZ,MX,MY,MZ,T,P,H,Alt,aT,aH,lat,lon,gps_alt,spd,crs,roll,pitch,yaw\n
- *   CC,ts,AX,AY,AZ,GX,GY,GZ,MX,MY,MZ,T,P,H,Alt,aT,aH,lat,lon,gps_alt,spd,crs,roll,pitch,yaw\n
+ *   CC,ts,AX,AY,AZ,GX,GY,GZ,MX,MY,MZ,T,P,H,Alt,aT,aH,lat,lon,gps_alt,spd,crs,roll,pitch,yaw,rel_alt,vel,g,dpdt,arm,state,pwm\n
  */
-
-#ifndef DEVICE_TYPE
- #warning "DEVICE_TYPE tanimlanmayib! Default: Payload (2)"
- #define DEVICE_TYPE 2
-#endif
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -37,15 +26,8 @@
 #include "attitude_ekf.h"
 
 // ======================== CIHAZ BASLIGI VE ADI ========================
-#if DEVICE_TYPE == 2
- #define DEVICE_HEADER F("BB")   // Payload
- #define DEVICE_NAME   "PAYLOAD (BB)"
-#elif DEVICE_TYPE == 3
- #define DEVICE_HEADER F("CC")   // Drone
- #define DEVICE_NAME   "DRONE (CC)"
-#else
- #error "DEVICE_TYPE 2 (BB Payload) veya 3 (CC Drone) olmalidir!"
-#endif
+#define DEVICE_HEADER F("CC")   // Drone
+#define DEVICE_NAME   "DRONE (CC)"
 
 // ======================== PIN ========================
 #define LED_PIN         13
@@ -144,11 +126,9 @@ static AttitudeEKF ekf;
 static Kalman1D kalmanTemp,kalmanAlt;
 static bool kalman_ready=false,aht_triggered=false;
 static uint32_t aht_trigger_ms=0,lastBno,lastBme,lastAht,lastGps,lastPrn,lastRf,lastI2cDiag;
-#if DEVICE_TYPE == 3
 static uint32_t lastFlight;
 static AltVel altvel;
 static FlightCtrl flight;
-#endif
 
 // Sensor data buferi
 static float ax,ay,az,gx,gy,gz,mx,my,mz;
@@ -280,22 +260,18 @@ static void i2c_scan_diag(){
 // ======================== SETUP ========================
 void setup(){
     pinMode(LED_PIN,OUTPUT);digitalWrite(LED_PIN,HIGH);
-#if DEVICE_TYPE == 3
     esc_init();   // ESC-ler guc acilanda derhal 1000 us alir (tehlukesizlik)
-#endif
     Serial.begin(115200);delay(200);
 
     Serial.println(F("\n=== TEENSY 4.1 " DEVICE_NAME " ==="));
     Serial.println(F("  IMU: AX,AY,AZ,GX,GY,GZ,MX,MY,MZ"));
     Serial.println(F("  BME280 + AHT20 + GPS + Kalman + Attitude EKF\n"));
 
-#if DEVICE_TYPE == 3
     rf_command_init();
     altvel.init();
     flight.init();
     Serial.println(F("[ESC] 50 Hz PWM: pin 15 + 23 (1000..2000 us)"));
     Serial.println(F("[RF-CMD] RX: '1'=ARM, '0'=DISARM"));
-#endif
 
     RF_SERIAL.begin(RF_BAUD);
 
@@ -331,9 +307,7 @@ void setup(){
 
     uint32_t now=millis();
     lastBno=lastBme=lastAht=lastGps=lastPrn=lastRf=lastI2cDiag=now;
-#if DEVICE_TYPE == 3
     lastFlight=now;
-#endif
     digitalWrite(LED_PIN,LOW);
 }
 
@@ -341,7 +315,6 @@ void setup(){
 void loop(){
     uint32_t now=millis();
 
-#if DEVICE_TYPE == 3
     rf_command_update();
 
     if(now-lastFlight>=FLIGHT_PERIOD){lastFlight=now;
@@ -354,16 +327,13 @@ void loop(){
         bool descending = (altvel.vel < 0.0f);
         flight.update(rf_armed(), level, descending, altvel.rel_alt, now);
     }
-#endif
 
     if(now-lastBno>=BNO055_PERIOD){lastBno=now;
         if(ok.bno055){bno055_read_raw(ax,ay,az,gx,gy,gz,mx,my,mz);ekf.predict(gx,gy,gz,0.01f);ekf.update(ax,ay,az);ekf.getEulerDeg(mad_roll,mad_pitch,mad_yaw);}
     }
     if(now-lastBme>=BME280_PERIOD){lastBme=now;
         if(ok.bme280){bme280_read(bme_t,bme_p,bme_h,bme_a);bme_tk=kalmanTemp.update(bme_t);bme_ak=kalmanAlt.update(bme_a);
-#if DEVICE_TYPE == 3
             altvel.update(bme_p, az, ax, ay);
-#endif
         }
     }
     if(ok.aht20&&now-lastAht>=AHT20_PERIOD){lastAht=now;if(aht_triggered)aht20_read_finish(aht_t,aht_h);aht20_trigger();}
@@ -379,14 +349,12 @@ void loop(){
         Serial.print(F(" | T:"));if(ok.bme280){Serial.print(bme_tk,1);Serial.print('/');Serial.print(bme_ak,1);}else Serial.print(F("OFF"));
         Serial.print(F(" | A:"));if(ok.aht20){Serial.print(aht_t,1);Serial.print('/');Serial.print(aht_h,1);}else Serial.print(F("OFF"));
         Serial.print(F(" | GPS:"));if(ok.gps_fix){Serial.print(gps.lat,5);Serial.print(',');Serial.print(gps.lon,5);}else Serial.print(F("NO"));
-#if DEVICE_TYPE == 3
         Serial.print(F(" | FLT:"));Serial.print(rf_armed()?F("ARM"):F("DISARM"));
         Serial.print('/');Serial.print((int)flight.state_code());
         Serial.print(F(" alt="));Serial.print(altvel.rel_alt,1);
         Serial.print(F(" vel="));Serial.print(altvel.vel,1);
         Serial.print(F(" g="));Serial.print(altvel.g_force,2);
         Serial.print(F(" pwm="));Serial.print(flight.throttle());
-#endif
         Serial.println();
     }
 
@@ -408,7 +376,6 @@ void loop(){
         else RF_SERIAL.print(F("N,N,N,N,N"));
         RF_SERIAL.print(',');
         RF_SERIAL.print(mad_roll,2);RF_SERIAL.print(',');RF_SERIAL.print(mad_pitch,2);RF_SERIAL.print(',');RF_SERIAL.print(mad_yaw,2);
-#if DEVICE_TYPE == 3
         RF_SERIAL.print(',');RF_SERIAL.print(altvel.rel_alt,2);
         RF_SERIAL.print(',');RF_SERIAL.print(altvel.vel,2);
         RF_SERIAL.print(',');RF_SERIAL.print(altvel.g_force,3);
@@ -416,7 +383,6 @@ void loop(){
         RF_SERIAL.print(',');RF_SERIAL.print(rf_armed()?1:0);
         RF_SERIAL.print(',');RF_SERIAL.print((int)flight.state_code());
         RF_SERIAL.print(',');RF_SERIAL.print(flight.throttle());
-#endif
         RF_SERIAL.println();
     }
 }
