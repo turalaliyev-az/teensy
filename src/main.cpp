@@ -218,11 +218,10 @@ static void aht20_read_finish(float&t,float&h){if(!aht_triggered)return;if(milli
 static bool bno055_init(){
     if(r8(BNO055_ADDR,BNO055_CHIP_ID)!=0xA0)return false;
     w8(BNO055_ADDR,BNO055_OPR_MODE,0x00);delay(30);   // CONFIG rejimi
-    w8(BNO055_ADDR,BNO055_SYS_TRIG,0x20);delay(650);  // RST_SYS (reset)
     w8(BNO055_ADDR,BNO055_PWR_MODE,0x00);delay(10);   // normal guc
     w8(BNO055_ADDR,BNO055_PAGE_ID,0x00);              // page 0 (data registerleri)
     w8(BNO055_ADDR,BNO055_UNIT_SEL,0x00);             // m/s2, dps, deg, C
-    w8(BNO055_ADDR,BNO055_SYS_TRIG,0x80);delay(50);   // CLK_SRC: xarici kristal (VACIB)
+    w8(BNO055_ADDR,BNO055_SYS_TRIG,0x80);delay(50);   // CLK_SRC: xarici kristal
     w8(BNO055_ADDR,BNO055_OPR_MODE,0x0C);delay(200);  // NDOF fusion
     return true;
 }
