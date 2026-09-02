@@ -481,7 +481,7 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define RF_BAUD         115200
 #define GPS_SERIAL      Serial7       
 #define GPS_BAUD        9600
-#define I2C_FREQ        400000UL
+#define I2C_FREQ        100000UL     // Diqqət: 400kHz əvəzinə 100kHz
 #define BNO055_ADDR     0x28
 #define BME280_ADDR     0x76
 #define AHT20_ADDR      0x38
@@ -493,6 +493,8 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define RF_PERIOD       66    
 #define FLIGHT_PERIOD   10    
 #define I2C_DIAG_PERIOD 5000  
+
+// Digər təyinatlar ... (kodunuzda olduğu kimi)
 #define BNO055_CHIP_ID      0x00
 #define BNO055_OPR_MODE     0x3D
 #define BNO055_PWR_MODE     0x3E
@@ -513,13 +515,6 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define AHT20_CMD_TRIG      0xAC
 #define AHT20_STAT_CAL      0x08
 #define AHT20_STAT_BUSY     0x80
-#define BNO055_ACC_SCALE        0.01f
-#define BNO055_GYRO_SCALE       0.00106526354f
-#define BNO055_MAG_SCALE        0.0625f
-#define BME280_TEMP_SCALE       0.01f
-#define BME280_PRESS_SCALE      0.0000390625f
-#define BME280_HUM_SCALE        0.0009765625f
-#define SEA_LEVEL_HPA           1013.25f
 
 static float nmea_to_decimal(float ddmm) {
     int deg = (int)(ddmm / 100.0f); 
@@ -635,8 +630,9 @@ static void gps_read(){
     }
 }
 
+// BME280 Üçün Düzəliş 
 static bool bme280_init(){
-    return bme.begin(0x76, &Wire);
+    return bme.begin(BME280_ADDR, &Wire); // I2C ünvanını aşkar göstəririk
 }
 
 static void bme280_read(float&t,float&p,float&h,float&a){
@@ -690,18 +686,24 @@ static void aht20_read_finish(float&t,float&h){
 
 static bool bno055_init(){
     if(!bno.begin()) return false;
-    bno.setExtCrystalUse(true);   // xarici kristal (CLK_SRC=0x80) — VACIB
+    delay(50); // Sensorun özünə gəlməsi üçün
+    bno.setExtCrystalUse(true);   // xarici kristal — VACIB
     return true;
 }
 
+// BNO055 Oxuma Xətası Düzəldildi
 static void bno055_read_raw(float&ax,float&ay,float&az,float&gx,float&gy,float&gz,float&mx,float&my,float&mz){
-    sensors_event_t e;
-    bno.getEvent(&e, Adafruit_BNO055::VECTOR_ACCELEROMETER);
-    ax=e.acceleration.x; ay=e.acceleration.y; az=e.acceleration.z;
-    bno.getEvent(&e, Adafruit_BNO055::VECTOR_GYROSCOPE);
-    gx=e.gyro.x; gy=e.gyro.y; gz=e.gyro.z;
-    bno.getEvent(&e, Adafruit_BNO055::VECTOR_MAGNETOMETER);
-    mx=e.magnetic.x; my=e.magnetic.y; mz=e.magnetic.z;
+    // İvəölçən
+    imu::Vector<3> accel = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
+    ax = accel.x(); ay = accel.y(); az = accel.z();
+    
+    // Jiroskop
+    imu::Vector<3> gyro = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
+    gx = gyro.x(); gy = gyro.y(); gz = gyro.z();
+    
+    // Maqnitometr
+    imu::Vector<3> mag = bno.getVector(Adafruit_BNO055::VECTOR_MAGNETOMETER);
+    mx = mag.x(); my = mag.y(); mz = mag.z();
 }
 
 static void i2c_scan_diag(){
@@ -713,27 +715,19 @@ static void i2c_scan_diag(){
             if(n<16) addrs[n++]=a; 
         } 
     }
-    bool bno=false,bme=false,aht=false;
+    bool bno_found=false,bme_found=false,aht_found=false;
     for(uint8_t i=0;i<n;i++){ 
-        if(addrs[i]==BNO055_ADDR)bno=true; 
-        else if(addrs[i]==BME280_ADDR)bme=true; 
-        else if(addrs[i]==AHT20_ADDR)aht=true; 
+        if(addrs[i]==BNO055_ADDR) bno_found=true; 
+        else if(addrs[i]==BME280_ADDR) bme_found=true; 
+        else if(addrs[i]==AHT20_ADDR) aht_found=true; 
     }
-    uint8_t opmode = bno ? r8(BNO055_ADDR, BNO055_OPR_MODE) : 0xFF;
-    uint8_t calib  = bno ? r8(BNO055_ADDR, BNO055_CALIB_STAT) : 0xFF;
-    Serial.print(F("[I2C] "));Serial.print(n);Serial.print(F(" dev | BNO055="));Serial.print(bno?1:0);
-    Serial.print(F(" BME280="));Serial.print(bme?1:0);Serial.print(F(" AHT20="));Serial.print(aht?1:0);
+    uint8_t opmode = bno_found ? r8(BNO055_ADDR, BNO055_OPR_MODE) : 0xFF;
+    uint8_t calib  = bno_found ? r8(BNO055_ADDR, BNO055_CALIB_STAT) : 0xFF;
+    Serial.print(F("[I2C] "));Serial.print(n);Serial.print(F(" dev | BNO055="));Serial.print(bno_found?1:0);
+    Serial.print(F(" BME280="));Serial.print(bme_found?1:0);Serial.print(F(" AHT20="));Serial.print(aht_found?1:0);
     Serial.print(F(" | mode=0x"));Serial.print(opmode,HEX); 
     Serial.print(F(" cal=0x"));Serial.print(calib,HEX); 
     Serial.println();
-    
-    RF_SERIAL.print(F("DIAG,"));RF_SERIAL.print(millis());RF_SERIAL.print(',');
-    RF_SERIAL.print(bno?1:0);RF_SERIAL.print(',');RF_SERIAL.print(bme?1:0);RF_SERIAL.print(',');RF_SERIAL.print(aht?1:0);
-    RF_SERIAL.print(',');RF_SERIAL.print(n);
-    for(uint8_t i=0;i<n;i++){RF_SERIAL.print(',');RF_SERIAL.print(F("0x"));RF_SERIAL.print(addrs[i],HEX);}
-    RF_SERIAL.print(',');RF_SERIAL.print(F("mode=0x"));RF_SERIAL.print(opmode,HEX);
-    RF_SERIAL.print(',');RF_SERIAL.print(F("cal=0x"));RF_SERIAL.print(calib,HEX); 
-    RF_SERIAL.println();
 }
 
 void setup(){
@@ -747,8 +741,9 @@ void setup(){
     altvel.init(); 
     flight.init();
     RF_SERIAL.begin(RF_BAUD);
+    
     Wire.begin();
-    Wire.setClock(I2C_FREQ);
+    Wire.setClock(I2C_FREQ); 
     i2c_scan_diag();
     
     ok.bno055=bno055_init();
