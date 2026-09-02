@@ -59,6 +59,7 @@
 #define BNO055_SYS_TRIG     0x3F
 #define BNO055_UNIT_SEL     0x3B
 #define BNO055_CALIB_STAT   0x35
+#define BNO055_PAGE_ID      0x07
 #define BNO055_ACC_START    0x08
 #define BNO055_MAG_START    0x0E
 #define BNO055_GYRO_START   0x14
@@ -219,8 +220,9 @@ static bool bno055_init(){
     w8(BNO055_ADDR,BNO055_OPR_MODE,0x00);delay(30);   // CONFIG rejimi
     w8(BNO055_ADDR,BNO055_SYS_TRIG,0x20);delay(650);  // RST_SYS (reset)
     w8(BNO055_ADDR,BNO055_PWR_MODE,0x00);delay(10);   // normal guc
+    w8(BNO055_ADDR,BNO055_PAGE_ID,0x00);              // page 0 (data registerleri)
     w8(BNO055_ADDR,BNO055_UNIT_SEL,0x00);             // m/s2, dps, deg, C
-    w8(BNO055_ADDR,BNO055_SYS_TRIG,0x80);delay(50);   // CLK_SRC: xarici kristal (VACIBDİR!)
+    w8(BNO055_ADDR,BNO055_SYS_TRIG,0x80);delay(50);   // CLK_SRC: xarici kristal (VACIB)
     w8(BNO055_ADDR,BNO055_OPR_MODE,0x0C);delay(200);  // NDOF fusion
     return true;
 }
@@ -244,9 +246,15 @@ static void i2c_scan_diag(){
         else if(addrs[i]==BME280_ADDR)bme=true;
         else if(addrs[i]==AHT20_ADDR)aht=true;
     }
+    // BNO055 diagnostika: OPR_MODE (0x0C=NDOF, 0x00=CONFIG) + kalibrasiya
+    uint8_t opmode = bno ? r8(BNO055_ADDR, BNO055_OPR_MODE) : 0xFF;
+    uint8_t calib  = bno ? r8(BNO055_ADDR, BNO055_CALIB_STAT) : 0xFF;
+
     // USB
     Serial.print(F("[I2C] "));Serial.print(n);Serial.print(F(" dev | BNO055="));Serial.print(bno?1:0);
     Serial.print(F(" BME280="));Serial.print(bme?1:0);Serial.print(F(" AHT20="));Serial.print(aht?1:0);
+    Serial.print(F(" | mode=0x"));Serial.print(opmode,HEX);
+    Serial.print(F(" cal=0x"));Serial.print(calib,HEX);
     Serial.print(F(" | "));
     for(uint8_t i=0;i<n;i++){Serial.print(F("0x"));Serial.print(addrs[i],HEX);Serial.print(' ');}
     Serial.println();
@@ -255,6 +263,8 @@ static void i2c_scan_diag(){
     RF_SERIAL.print(bno?1:0);RF_SERIAL.print(',');RF_SERIAL.print(bme?1:0);RF_SERIAL.print(',');RF_SERIAL.print(aht?1:0);
     RF_SERIAL.print(',');RF_SERIAL.print(n);
     for(uint8_t i=0;i<n;i++){RF_SERIAL.print(',');RF_SERIAL.print(F("0x"));RF_SERIAL.print(addrs[i],HEX);}
+    RF_SERIAL.print(',');RF_SERIAL.print(F("mode=0x"));RF_SERIAL.print(opmode,HEX);
+    RF_SERIAL.print(',');RF_SERIAL.print(F("cal=0x"));RF_SERIAL.print(calib,HEX);
     RF_SERIAL.println();
 }
 
