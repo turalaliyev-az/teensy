@@ -168,9 +168,11 @@ static void gps_parse_gpgga(char*s){
     char*p=s;
     for(int i=0;i<1;i++){p=strchr(p,',');if(!p)return;p++;}
     float lat_raw=strtof(p,&p);if(!p||*p!=',')return;p++;
-    if(*p=='S')lat_raw=-lat_raw;p=strchr(p,',');if(!p)return;p++;
+    if(*p=='S')lat_raw=-lat_raw;
+    p=strchr(p,',');if(!p)return;p++;
     float lon_raw=strtof(p,&p);if(!p||*p!=',')return;p++;
-    if(*p=='W')lon_raw=-lon_raw;p=strchr(p,',');if(!p)return;p++;
+    if(*p=='W')lon_raw=-lon_raw;
+    p=strchr(p,',');if(!p)return;p++;
     int fix=(int)strtol(p,&p,10);if(!p||*p!=',')return;p++;
     int sats=(int)strtol(p,&p,10);if(!p)return;
     for(int i=0;i<2;i++){p=strchr(p,',');if(!p)return;p++;}
@@ -199,7 +201,8 @@ static void gps_read(){
 
 // ======================== BME280 ========================
 static bool bme280_init(){
-    if(r8(BME280_ADDR,BME280_CHIP_ID)!=0x60)return false;uint8_t buf[26];rBuf(BME280_ADDR,BME280_CALIB_START,buf,26);
+    if(r8(BME280_ADDR,BME280_CHIP_ID)!=0x60)return false;
+    uint8_t buf[26];rBuf(BME280_ADDR,BME280_CALIB_START,buf,26);
     dig_T1=buf[0]|(buf[1]<<8);dig_T2=buf[2]|(buf[3]<<8);dig_T3=buf[4]|(buf[5]<<8);
     dig_P1=buf[6]|(buf[7]<<8);dig_P2=buf[8]|(buf[9]<<8);dig_P3=buf[10]|(buf[11]<<8);dig_P4=buf[12]|(buf[13]<<8);
     dig_P5=buf[14]|(buf[15]<<8);dig_P6=buf[16]|(buf[17]<<8);dig_P7=buf[18]|(buf[19]<<8);dig_P8=buf[20]|(buf[21]<<8);
