@@ -541,7 +541,7 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define LED_PIN         13
 #define RF_SERIAL       Serial2
 #define RF_BAUD         115200
-#define GPS_SERIAL      Serial7
+#define GPS_SERIAL      Serial6
 #define GPS_BAUD        9600
 #define I2C_FREQ        400000UL
 #define BNO055_PERIOD   10
