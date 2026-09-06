@@ -7,10 +7,15 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_AHTX0.h>
 
+#include <TinyGPS++.h>
+
 // ======================== SENSOR OBYEKTLERI ========================
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 Adafruit_BME280 bme;
 Adafruit_AHTX0 aht;
+
+// ======================== GPS (TinyGPS++) ========================
+static TinyGPSPlus tgps;   // TinyGPS++ obyekti (butun NMEA prefikslerini taniyir)
 
 // ======================== ESC (50 Hz PWM) ========================
 #define ESC1_PIN      15
@@ -50,8 +55,6 @@ void esc_write_us(uint16_t us) {
 }
 
 // ======================== RF EMRLERI (Ehtiyat kilidi) ========================
-// DEFAULT: ARMED (sistem avtomatik hazirdir, ARM emri lazim deyil)
-// '0' = DISARM (ehtiyat kilidi), '1' = ARM (yeniden aktiv)
 static bool _armed = true;
 static bool _last_ack = true;
 
@@ -63,9 +66,13 @@ void rf_command_init() {
 void rf_command_update() {
     while (Serial2.available()) {
         char c = (char)Serial2.read();
-        if (c == '1')      _armed = true;
-        else if (c == '0') _armed = false;
-        else continue;
+        if (c == '1') {
+            _armed = true;
+        } else if (c == '0') {
+            _armed = false;
+        } else {
+            continue;
+        }
 
         if (_armed != _last_ack) {
             _last_ack = _armed;
@@ -79,7 +86,7 @@ bool rf_armed() {
     return _armed;
 }
 
-// ======================== HUNDURLUK + SURET (IMU + BARO fusion) ========================
+// ======================== HUNDURLUK + SURET ========================
 struct AltVel {
     float rel_alt;
     float vel;
@@ -99,9 +106,7 @@ private:
     float _g_smooth;
     uint32_t _last_us;
     bool _have_prev;
-
     float _P00, _P01, _P11;
-
     uint32_t _calib_start_ms;
     float _calib_sum;
     uint32_t _calib_count;
@@ -166,9 +171,10 @@ void AltVel::update(float pressure_hpa, float az, float ax, float ay, bool imu_o
     _prev_p = _p_smooth;
     dpdt = _dpdt_smooth;
 
-    // Boot kalibrasiyasi (yalniz baslangicda, ARM/DISARM-dan asili deyil)
     if (!_calibrated) {
-        if (_calib_start_ms == 0) _calib_start_ms = millis();
+        if (_calib_start_ms == 0) {
+            _calib_start_ms = millis();
+        }
         _calib_sum += pressure_hpa;
         _calib_count++;
         rel_alt = 0.0f;
@@ -247,11 +253,12 @@ void FlightCtrl::update(bool armed, bool level_ok, bool descending, float rel_al
     uint32_t dt_ms = 0;
     if (_last_ms != 0) {
         dt_ms = now_ms - _last_ms;
-        if (dt_ms > 100) dt_ms = 100;
+        if (dt_ms > 100) {
+            dt_ms = 100;
+        }
     }
     _last_ms = now_ms;
 
-    // DISARM = EHTIYAT KILIDI: Motorlar hec vaxt islemir
     if (!armed) {
         state = FS_DISARMED;
         throttle_us = (float)ESC_US_OFF;
@@ -259,17 +266,12 @@ void FlightCtrl::update(bool armed, bool level_ok, bool descending, float rel_al
         return;
     }
 
-    // ARMED: Sistem avtomatik islemeye hazirdir
     if (state == FS_DISARMED) {
         state = FS_ARMED;
         throttle_us = (float)ESC_US_OFF;
     }
 
     if (state == FS_ARMED) {
-        // Avtomatik ise dusme sertleri:
-        // 1. level_ok: Roll/Pitch <= +-5 derece
-        // 2. descending: vel < 0 (asagi duser)
-        // 3. rel_alt <= 500m
         if (level_ok && descending && (rel_alt <= ALT_TRIGGER_M)) {
             state = FS_MOTORS_ON;
         }
@@ -281,7 +283,6 @@ void FlightCtrl::update(bool armed, bool level_ok, bool descending, float rel_al
             return;
         }
 
-        // Pille-pille artma: 1000 -> 1480, 500ms
         if (throttle_us < (float)ESC_US_RUN) {
             throttle_us += RAMP_STEP_US * (float)dt_ms;
             if (throttle_us > (float)ESC_US_RUN) {
@@ -333,13 +334,21 @@ void AttitudeEKF::init(float ax, float ay, float az) {
     } else if (d < -0.999999f) {
         q[0]=0.0f; q[1]=1.0f; q[2]=q[3]=0.0f;
     } else {
-        float ang = acosf(d); float s = sinf(ang * 0.5f);
+        float ang = acosf(d);
+        float s = sinf(ang * 0.5f);
         float an = sqrtf(axis_x*axis_x + axis_y*axis_y);
         if (an < 1e-8f) an = 1.0f;
-        q[0] = cosf(ang * 0.5f); q[1] = s * axis_x / an; q[2] = s * axis_y / an; q[3] = s * axis_z / an;
+        q[0] = cosf(ang * 0.5f);
+        q[1] = s * axis_x / an;
+        q[2] = s * axis_y / an;
+        q[3] = s * axis_z / an;
     }
     b[0] = b[1] = b[2] = 0.0f;
-    for (int i=0;i<7;i++) for (int j=0;j<7;j++) P[i][j] = 0.0f;
+    for (int i=0; i<7; i++) {
+        for (int j=0; j<7; j++) {
+            P[i][j] = 0.0f;
+        }
+    }
     P[0][0]=P[1][1]=P[2][2]=P[3][3]=0.1f;
     P[4][4]=P[5][5]=P[6][6]=0.1f;
 }
@@ -355,7 +364,11 @@ void AttitudeEKF::predict(float gx, float gy, float gz, float dt) {
     quat_norm(q);
 
     float F[7][7];
-    for (int i=0;i<7;i++) for (int j=0;j<7;j++) F[i][j] = 0.0f;
+    for (int i=0; i<7; i++) {
+        for (int j=0; j<7; j++) {
+            F[i][j] = 0.0f;
+        }
+    }
     F[0][0]=1.0f; F[0][1]=-0.5f*wx*dt; F[0][2]=-0.5f*wy*dt; F[0][3]=-0.5f*wz*dt;
     F[1][0]= 0.5f*wx*dt; F[1][1]=1.0f; F[1][2]= 0.5f*wz*dt; F[1][3]=-0.5f*wy*dt;
     F[2][0]= 0.5f*wy*dt; F[2][1]=-0.5f*wz*dt; F[2][2]=1.0f; F[2][3]= 0.5f*wx*dt;
@@ -367,7 +380,11 @@ void AttitudeEKF::predict(float gx, float gy, float gz, float dt) {
     F[4][4]=F[5][5]=F[6][6]=1.0f;
 
     float Q[7][7];
-    for (int i=0;i<7;i++) for (int j=0;j<7;j++) Q[i][j] = 0.0f;
+    for (int i=0; i<7; i++) {
+        for (int j=0; j<7; j++) {
+            Q[i][j] = 0.0f;
+        }
+    }
     float Xi[4][3] = {
         {-q[1], -q[2], -q[3]},
         { q[0], -q[3],  q[2]},
@@ -376,10 +393,12 @@ void AttitudeEKF::predict(float gx, float gy, float gz, float dt) {
     };
     float qg = GYRO_NOISE * GYRO_NOISE;
     float s = 0.25f * qg * dt * dt;
-    for (int i=0;i<4;i++) {
-        for (int j=0;j<4;j++) {
+    for (int i=0; i<4; i++) {
+        for (int j=0; j<4; j++) {
             float sum = 0.0f;
-            for (int k=0;k<3;k++) sum += Xi[i][k] * Xi[j][k];
+            for (int k=0; k<3; k++) {
+                sum += Xi[i][k] * Xi[j][k];
+            }
             Q[i][j] = s * sum;
         }
     }
@@ -388,17 +407,21 @@ void AttitudeEKF::predict(float gx, float gy, float gz, float dt) {
     Q[4][4]=Q[5][5]=Q[6][6]=qb;
 
     float FP[7][7];
-    for (int i=0;i<7;i++) {
-        for (int j=0;j<7;j++) {
-            float sum=0.0f;
-            for (int k=0;k<7;k++) sum += F[i][k] * P[k][j];
+    for (int i=0; i<7; i++) {
+        for (int j=0; j<7; j++) {
+            float sum = 0.0f;
+            for (int k=0; k<7; k++) {
+                sum += F[i][k] * P[k][j];
+            }
             FP[i][j] = sum;
         }
     }
-    for (int i=0;i<7;i++) {
-        for (int j=0;j<7;j++) {
-            float sum=0.0f;
-            for (int k=0;k<7;k++) sum += FP[i][k] * F[j][k];
+    for (int i=0; i<7; i++) {
+        for (int j=0; j<7; j++) {
+            float sum = 0.0f;
+            for (int k=0; k<7; k++) {
+                sum += FP[i][k] * F[j][k];
+            }
             P[i][j] = sum + Q[i][j];
         }
     }
@@ -407,14 +430,19 @@ void AttitudeEKF::predict(float gx, float gy, float gz, float dt) {
 void AttitudeEKF::update(float ax, float ay, float az) {
     float amag = sqrtf(ax*ax + ay*ay + az*az);
     if (amag < ACC_MIN || amag > ACC_MAX) return;
-    float n = 1.0f / amag; ax *= n; ay *= n; az *= n;
+    float n = 1.0f / amag;
+    ax *= n; ay *= n; az *= n;
     float h0 = 2.0f * (q[1]*q[3] - q[0]*q[2]);
     float h1 = 2.0f * (q[2]*q[3] + q[0]*q[1]);
     float h2 = q[0]*q[0] - q[1]*q[1] - q[2]*q[2] + q[3]*q[3];
-    float y0 = ax - h0; float y1 = ay - h1; float y2 = az - h2;
+    float y0 = ax - h0;
+    float y1 = ay - h1;
+    float y2 = az - h2;
 
     float H[3][7];
-    for (int j=0;j<7;j++) H[0][j]=H[1][j]=H[2][j]=0.0f;
+    for (int j=0; j<7; j++) {
+        H[0][j]=H[1][j]=H[2][j]=0.0f;
+    }
     H[0][0]=-2.0f*q[2]; H[0][1]= 2.0f*q[3]; H[0][2]=-2.0f*q[0]; H[0][3]= 2.0f*q[1];
     H[1][0]= 2.0f*q[1]; H[1][1]= 2.0f*q[0]; H[1][2]= 2.0f*q[3]; H[1][3]= 2.0f*q[2];
     H[2][0]= 2.0f*q[0]; H[2][1]=-2.0f*q[1]; H[2][2]=-2.0f*q[2]; H[2][3]= 2.0f*q[3];
@@ -423,18 +451,22 @@ void AttitudeEKF::update(float ax, float ay, float az) {
     float r = R_BASE + R_ADAPT * dev * dev;
 
     float PHt[7][3];
-    for (int i=0;i<7;i++) {
-        for (int j=0;j<3;j++) {
-            float sum=0.0f;
-            for (int k=0;k<7;k++) sum += P[i][k] * H[j][k];
+    for (int i=0; i<7; i++) {
+        for (int j=0; j<3; j++) {
+            float sum = 0.0f;
+            for (int k=0; k<7; k++) {
+                sum += P[i][k] * H[j][k];
+            }
             PHt[i][j] = sum;
         }
     }
     float S[3][3];
-    for (int i=0;i<3;i++) {
-        for (int j=0;j<3;j++) {
-            float sum=0.0f;
-            for (int k=0;k<7;k++) sum += H[i][k] * PHt[k][j];
+    for (int i=0; i<3; i++) {
+        for (int j=0; j<3; j++) {
+            float sum = 0.0f;
+            for (int k=0; k<7; k++) {
+                sum += H[i][k] * PHt[k][j];
+            }
             S[i][j] = sum;
         }
     }
@@ -457,10 +489,12 @@ void AttitudeEKF::update(float ax, float ay, float az) {
     Si[2][2]=(S[0][0]*S[1][1]-S[0][1]*S[1][0])*id;
 
     float K[7][3];
-    for (int i=0;i<7;i++) {
-        for (int j=0;j<3;j++) {
-            float sum=0.0f;
-            for (int k=0;k<3;k++) sum += PHt[i][k] * Si[k][j];
+    for (int i=0; i<7; i++) {
+        for (int j=0; j<3; j++) {
+            float sum = 0.0f;
+            for (int k=0; k<3; k++) {
+                sum += PHt[i][k] * Si[k][j];
+            }
             K[i][j] = sum;
         }
     }
@@ -474,22 +508,30 @@ void AttitudeEKF::update(float ax, float ay, float az) {
     b[2] += K[6][0]*y0 + K[6][1]*y1 + K[6][2]*y2;
 
     float KH[7][7];
-    for (int i=0;i<7;i++) {
-        for (int j=0;j<7;j++) {
-            float sum=0.0f;
-            for (int k=0;k<3;k++) sum += K[i][k] * H[k][j];
+    for (int i=0; i<7; i++) {
+        for (int j=0; j<7; j++) {
+            float sum = 0.0f;
+            for (int k=0; k<3; k++) {
+                sum += K[i][k] * H[k][j];
+            }
             KH[i][j] = sum;
         }
     }
     float Pnew[7][7];
-    for (int i=0;i<7;i++) {
-        for (int j=0;j<7;j++) {
-            float sum=0.0f;
-            for (int k=0;k<7;k++) sum += ((i==k?1.0f:0.0f) - KH[i][k]) * P[k][j];
+    for (int i=0; i<7; i++) {
+        for (int j=0; j<7; j++) {
+            float sum = 0.0f;
+            for (int k=0; k<7; k++) {
+                sum += ((i==k?1.0f:0.0f) - KH[i][k]) * P[k][j];
+            }
             Pnew[i][j] = sum;
         }
     }
-    for (int i=0;i<7;i++) for (int j=0;j<7;j++) P[i][j] = Pnew[i][j];
+    for (int i=0; i<7; i++) {
+        for (int j=0; j<7; j++) {
+            P[i][j] = Pnew[i][j];
+        }
+    }
 }
 
 void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
@@ -504,8 +546,10 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define LED_PIN         13
 #define RF_SERIAL       Serial2
 #define RF_BAUD         115200
+// Serial6: Teensy 4.1 pin 0 = RX6, pin 1 = TX6
 #define GPS_SERIAL      Serial6
 #define GPS_BAUD        9600
+#define GPS_AGE_MAX_MS  3000UL   // 3 saniyeden kohne data = fix itirilib
 #define I2C_FREQ        400000UL
 #define BNO055_PERIOD   10
 #define BME280_PERIOD   40
@@ -514,15 +558,10 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define PRINT_PERIOD    200
 #define RF_PERIOD       66
 #define FLIGHT_PERIOD   10
+#define GPS_DEBUG_PERIOD 5000
 #define SEA_LEVEL_HPA   1013.25f
 
-// ======================== GPS ========================
-static float nmea_to_decimal(float ddmm) {
-    int deg = (int)(ddmm / 100.0f);
-    float min = ddmm - (float)(deg * 100);
-    return (float)deg + min / 60.0f;
-}
-
+// ======================== GPS DATA (TinyGPS++-dan doldurulur) ========================
 struct GPSData {
     float lat, lon, altitude, speed, course;
     uint8_t fix, satellites;
@@ -530,68 +569,49 @@ struct GPSData {
     GPSData() : lat(0),lon(0),altitude(0),speed(0),course(0),fix(0),satellites(0),updated(false) {}
 };
 static GPSData gps;
-static char gps_buf[128];
-static uint8_t gps_idx = 0;
 
-static void gps_parse_gpgga(char*s){
-    char*p=s;
-    for(int i=0;i<1;i++){p=strchr(p,',');if(!p)return;p++;}
-    float lat_raw=strtof(p,&p);if(!p||*p!=',')return;p++;
-    if(*p=='S')lat_raw=-lat_raw;
-    p=strchr(p,',');if(!p)return;p++;
-    float lon_raw=strtof(p,&p);if(!p||*p!=',')return;p++;
-    if(*p=='W')lon_raw=-lon_raw;
-    p=strchr(p,',');if(!p)return;p++;
-    int fix=(int)strtol(p,&p,10);if(!p||*p!=',')return;p++;
-    int sats=(int)strtol(p,&p,10);if(!p)return;
-    for(int i=0;i<2;i++){p=strchr(p,',');if(!p)return;p++;}
-    float alt=strtof(p,&p);
-    gps.lat=nmea_to_decimal(fabsf(lat_raw))*(lat_raw<0?-1:1);
-    gps.lon=nmea_to_decimal(fabsf(lon_raw))*(lon_raw<0?-1:1);
-    gps.altitude=alt;gps.fix=(uint8_t)fix;gps.satellites=(uint8_t)sats;gps.updated=true;
-}
+// TinyGPS++ diaqnostika
+static void gps_debug_dump() {
+    Serial.print(F("[GPS] chars=")); Serial.print(tgps.charsProcessed());
+    Serial.print(F(" fixSent=")); Serial.print(tgps.sentencesWithFix());
+    Serial.print(F(" badCRC=")); Serial.print(tgps.failedChecksum());
+    Serial.print(F(" | fix=")); Serial.print(gps.fix);
+    Serial.print(F(" sats=")); Serial.print(gps.satellites);
+    Serial.print(F(" lat=")); Serial.print(gps.lat, 5);
+    Serial.print(F(" lon=")); Serial.print(gps.lon, 5);
+    Serial.print(F(" alt=")); Serial.print(gps.altitude, 1);
 
-static void gps_parse_gprmc(char*s){
-    char*p=s;
-    for(int i=0;i<1;i++){p=strchr(p,',');if(!p)return;p++;}
-    p=strchr(p,',');if(!p)return;p++;
-    if(*p!='A')return;
-    for(int i=0;i<4;i++){p=strchr(p,',');if(!p)return;p++;}
-    float spd=strtof(p,&p);if(!p||*p!=',')return;p++;
-    float crs=strtof(p,&p);
-    gps.speed=spd*0.514444f;gps.course=crs;
-}
-
-static void gps_read(){
-    while(GPS_SERIAL.available()){
-        char c=GPS_SERIAL.read();
-        if(c=='$'){
-            gps_idx=0;gps_buf[0]='$';gps_buf[1]=0;
-        }
-        else if(c=='\n'){
-            gps_buf[gps_idx]=0;
-            if(strncmp(gps_buf,"$GPGGA",6)==0)gps_parse_gpgga(gps_buf);
-            else if(strncmp(gps_buf,"$GPRMC",6)==0)gps_parse_gprmc(gps_buf);
-            gps_idx=0;
-        }
-        else if(gps_idx<127){
-            gps_buf[gps_idx++]=c;gps_buf[gps_idx]=0;
-        }
+    if (tgps.charsProcessed() == 0) {
+        Serial.println(F("  << GPS-DEN HECH NE GELMIR! (Naqil/Baud yoxlayin)"));
+    } else if (tgps.failedChecksum() > 10 && tgps.sentencesWithFix() == 0) {
+        Serial.println(F("  << CHECKSUM XETASI! (Baud rate sehfdir)"));
+    } else if (tgps.sentencesWithFix() == 0) {
+        Serial.println(F("  << MESAJ VAR, FIX YOXDUR (Acik sema lazimdir)"));
+    } else {
+        Serial.println(F("  << OK"));
     }
 }
 
 // ======================== KALMAN ========================
 struct Kalman1D {
     float Q,R,P,K,X;
-    void init(float q,float r,float x0){Q=q;R=r;P=1;K=0;X=x0;}
-    float update(float z){P+=Q;K=P/(P+R);X+=K*(z-X);P=(1-K)*P;return X;}
+    void init(float q,float r,float x0) {
+        Q=q; R=r; P=1; K=0; X=x0;
+    }
+    float update(float z) {
+        P += Q;
+        K = P/(P+R);
+        X += K*(z-X);
+        P = (1-K)*P;
+        return X;
+    }
 };
 
 // ======================== GLOBAL ========================
-static struct{uint8_t bno055:1,bme280:1,aht20:1,gps_fix:1;} ok;
+static struct { uint8_t bno055:1, bme280:1, aht20:1, gps_fix:1; } ok;
 static AttitudeEKF ekf;
-static Kalman1D kalmanTemp,kalmanAlt;
-static uint32_t lastBno,lastBme,lastAht,lastGps,lastPrn,lastRf;
+static Kalman1D kalmanTemp, kalmanAlt;
+static uint32_t lastBno, lastBme, lastAht, lastGps, lastPrn, lastRf, lastGpsDbg;
 static uint32_t lastFlight;
 static AltVel altvel;
 static FlightCtrl flight;
@@ -602,15 +622,16 @@ static float aht_t,aht_h;
 static float mad_roll,mad_pitch,mad_yaw;
 
 // ======================== SETUP ========================
-void setup(){
-    pinMode(LED_PIN,OUTPUT);
-    digitalWrite(LED_PIN,HIGH);
+void setup() {
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH);
     esc_init();
     Serial.begin(115200);
     delay(200);
     Serial.println(F("\n=== TEENSY 4.1 " DEVICE_NAME " ==="));
     Serial.println(F("[REJIM] AVTOMATIK: 500m + Enish + +-5Derece -> ESC 1480us"));
     Serial.println(F("[RF] Default=ARMED | '0'=DISARM(ehtiyat) | '1'=ARM(aktiv)"));
+    Serial.println(F("[GPS] TinyGPS++ kitabxanasi (universal NMEA)"));
 
     rf_command_init();
     altvel.init();
@@ -622,7 +643,7 @@ void setup(){
 
     // BNO055
     Serial.print(F("BNO055: "));
-    if(!bno.begin()) {
+    if (!bno.begin()) {
         Serial.println(F("FAIL"));
         ok.bno055 = false;
     } else {
@@ -632,7 +653,8 @@ void setup(){
         uint8_t sys, gyro, accel, mag;
         bno.getCalibration(&sys, &gyro, &accel, &mag);
         Serial.print(F("OK (Cal: ")); Serial.print(sys); Serial.print('/');
-        Serial.print(gyro); Serial.print('/'); Serial.print(accel); Serial.print('/'); Serial.print(mag); Serial.println(F(")"));
+        Serial.print(gyro); Serial.print('/'); Serial.print(accel); Serial.print('/');
+        Serial.print(mag); Serial.println(F(")"));
     }
 
     // BME280
@@ -667,43 +689,50 @@ void setup(){
     aht_t = 0.0f;
     aht_h = 0.0f;
 
-    // GPS
+    // GPS (TinyGPS++)
     GPS_SERIAL.begin(GPS_BAUD);
-    Serial.print(F("GPS:    Serial7 @ ")); Serial.print(GPS_BAUD); Serial.println(F(" baud"));
+    Serial.print(F("GPS:    Serial7 @ ")); Serial.print(GPS_BAUD);
+    Serial.println(F(" baud (pin0=RX, pin1=TX) - TinyGPS++"));
 
     // EKF
     ekf.init(0.0f, 0.0f, 9.80665f);
     Serial.println(F("[FILTER] Attitude EKF initialized"));
 
-    Serial.print(F("[RF] Serial2 @ ")); Serial.print(RF_BAUD); Serial.print(F(" baud, Header: ")); Serial.println(DEVICE_HEADER);
+    Serial.print(F("[RF] Serial2 @ ")); Serial.print(RF_BAUD);
+    Serial.print(F(" baud, Header: ")); Serial.println(DEVICE_HEADER);
 
-    uint32_t now=millis();
-    lastBno=lastBme=lastAht=lastGps=lastPrn=lastRf=now;
-    lastFlight=now;
-    digitalWrite(LED_PIN,LOW);
+    uint32_t now = millis();
+    lastBno = lastBme = lastAht = lastGps = lastPrn = lastRf = lastGpsDbg = now;
+    lastFlight = now;
+    digitalWrite(LED_PIN, LOW);
 }
 
 // ======================== LOOP ========================
-void loop(){
-    uint32_t now=millis();
+void loop() {
+    uint32_t now = millis();
     rf_command_update();
 
+    // GPS: TinyGPS++ feed (her loop-da, buffer itirmemek ucun)
+    while (GPS_SERIAL.available() > 0) {
+        tgps.encode(GPS_SERIAL.read());
+    }
+
     // Ucus Nezaretcisi (100 Hz)
-    if(now-lastFlight>=FLIGHT_PERIOD){
-        lastFlight=now;
-        float tilt=fmaxf(fabsf(mad_roll),fabsf(mad_pitch));
+    if (now - lastFlight >= FLIGHT_PERIOD) {
+        lastFlight = now;
+        float tilt = fmaxf(fabsf(mad_roll), fabsf(mad_pitch));
         bool level_ok = (tilt <= 5.0f);
-        if(!ok.bno055){
-            level_ok=false;
+        if (!ok.bno055) {
+            level_ok = false;
         }
         bool descending = (altvel.vel < 0.0f);
         flight.update(rf_armed(), level_ok, descending, altvel.rel_alt, now);
     }
 
     // IMU / BNO055 (100 Hz)
-    if(now-lastBno>=BNO055_PERIOD){
-        lastBno=now;
-        if(ok.bno055){
+    if (now - lastBno >= BNO055_PERIOD) {
+        lastBno = now;
+        if (ok.bno055) {
             sensors_event_t event;
             bno.getEvent(&event, Adafruit_BNO055::VECTOR_ACCELEROMETER);
             ax = event.acceleration.x;
@@ -727,9 +756,9 @@ void loop(){
     }
 
     // Baro / BME280 (25 Hz)
-    if(now-lastBme>=BME280_PERIOD){
-        lastBme=now;
-        if(ok.bme280){
+    if (now - lastBme >= BME280_PERIOD) {
+        lastBme = now;
+        if (ok.bme280) {
             bme_t = bme.readTemperature();
             bme_p = bme.readPressure() / 100.0f;
             bme_h = bme.readHumidity();
@@ -743,53 +772,101 @@ void loop(){
     }
 
     // Temp / AHT20 (1 Hz)
-    if(ok.aht20 && now-lastAht>=AHT20_PERIOD){
-        lastAht=now;
+    if (ok.aht20 && now - lastAht >= AHT20_PERIOD) {
+        lastAht = now;
         sensors_event_t humidity, temp;
         aht.getEvent(&humidity, &temp);
         aht_t = temp.temperature;
         aht_h = humidity.relative_humidity;
     }
 
-    // GPS
-    gps_read();
-    if(now-lastGps>=GPS_PERIOD){
-        lastGps=now;
-        ok.gps_fix=(gps.fix>0);
+    // GPS status yenileme (5 Hz) - TinyGPS++ obyektinden
+    if (now - lastGps >= GPS_PERIOD) {
+        lastGps = now;
+
+        // Data teze deyilse (3 saniyeden kohne) -> fix yoxdur
+        bool fresh = (tgps.location.age() < GPS_AGE_MAX_MS);
+
+        if (tgps.location.isValid() && fresh) {
+            gps.lat = (float)tgps.location.lat();
+            gps.lon = (float)tgps.location.lng();
+            gps.fix = 1;
+        } else {
+            gps.fix = 0;
+        }
+
+        if (tgps.altitude.isValid()) {
+            gps.altitude = (float)tgps.altitude.meters();
+        }
+        if (tgps.speed.isValid()) {
+            gps.speed = (float)tgps.speed.mps();
+        }
+        if (tgps.course.isValid()) {
+            gps.course = (float)tgps.course.deg();
+        }
+        gps.satellites = (uint8_t)tgps.satellites.value();
+        gps.updated = tgps.location.isUpdated();
+
+        ok.gps_fix = (gps.fix > 0);
+    }
+
+    // GPS Debug Diaqnostika (5 saniyede bir)
+    if (now - lastGpsDbg >= GPS_DEBUG_PERIOD) {
+        lastGpsDbg = now;
+        gps_debug_dump();
     }
 
     // Status LED
-    static bool led=false;
-    if(now&0x200){
-        if(!led){ digitalWrite(LED_PIN,HIGH); led=true; }
-    }else{
-        if(led){ digitalWrite(LED_PIN,LOW); led=false; }
+    static bool led = false;
+    if (now & 0x200) {
+        if (!led) {
+            digitalWrite(LED_PIN, HIGH);
+            led = true;
+        }
+    } else {
+        if (led) {
+            digitalWrite(LED_PIN, LOW);
+            led = false;
+        }
     }
 
     // USB Serial Cixisi (5 Hz)
-    if(now-lastPrn>=PRINT_PERIOD){
-        lastPrn=now;
+    if (now - lastPrn >= PRINT_PERIOD) {
+        lastPrn = now;
         Serial.print(now); Serial.print(' ');
-        if(ok.bno055){
-            Serial.print(F("A:")); Serial.print(ax,2); Serial.print(','); Serial.print(ay,2); Serial.print(','); Serial.print(az,2);
-            Serial.print(F(" G:")); Serial.print(gx,3); Serial.print(','); Serial.print(gy,3); Serial.print(','); Serial.print(gz,3);
+        if (ok.bno055) {
+            Serial.print(F("A:")); Serial.print(ax,2); Serial.print(',');
+            Serial.print(ay,2); Serial.print(','); Serial.print(az,2);
+            Serial.print(F(" G:")); Serial.print(gx,3); Serial.print(',');
+            Serial.print(gy,3); Serial.print(','); Serial.print(gz,3);
         } else {
             Serial.print(F("IMU:OFF"));
         }
         Serial.print(F(" | T:"));
-        if(ok.bme280){ Serial.print(bme_tk,1); Serial.print('/'); Serial.print(bme_ak,1); }
-        else { Serial.print(F("OFF")); }
+        if (ok.bme280) {
+            Serial.print(bme_tk,1); Serial.print('/'); Serial.print(bme_ak,1);
+        } else {
+            Serial.print(F("OFF"));
+        }
 
         Serial.print(F(" | A:"));
-        if(ok.aht20 && !isnan(aht_t)){ Serial.print(aht_t,1); Serial.print('/'); Serial.print(aht_h,1); }
-        else { Serial.print(F("OFF")); }
+        if (ok.aht20 && !isnan(aht_t)) {
+            Serial.print(aht_t,1); Serial.print('/'); Serial.print(aht_h,1);
+        } else {
+            Serial.print(F("OFF"));
+        }
 
         Serial.print(F(" | GPS:"));
-        if(ok.gps_fix){ Serial.print(gps.lat,5); Serial.print(','); Serial.print(gps.lon,5); }
-        else { Serial.print(F("NO")); }
+        if (ok.gps_fix) {
+            Serial.print(gps.lat,5); Serial.print(',');
+            Serial.print(gps.lon,5);
+            Serial.print(F(" sat:")); Serial.print(gps.satellites);
+        } else {
+            Serial.print(F("NO(chars:")); Serial.print(tgps.charsProcessed()); Serial.print(F(")"));
+        }
 
         Serial.print(F(" | FLT:"));
-        Serial.print(rf_armed()?F("ARM"):F("DISARM"));
+        Serial.print(rf_armed() ? F("ARM") : F("DISARM"));
         Serial.print('/'); Serial.print((int)flight.state_code());
         Serial.print(F(" alt=")); Serial.print(altvel.rel_alt,2);
         Serial.print(F(" vel=")); Serial.print(altvel.vel,2);
@@ -799,49 +876,63 @@ void loop(){
     }
 
     // RF Modula Gonderme (15 Hz)
-    if(now-lastRf>=RF_PERIOD){
-        lastRf=now;
+    if (now - lastRf >= RF_PERIOD) {
+        lastRf = now;
         RF_SERIAL.print(DEVICE_HEADER); RF_SERIAL.print(',');
         RF_SERIAL.print(now); RF_SERIAL.print(',');
 
-        if(ok.bno055){
-            RF_SERIAL.print(ax,3); RF_SERIAL.print(','); RF_SERIAL.print(ay,3); RF_SERIAL.print(','); RF_SERIAL.print(az,3); RF_SERIAL.print(',');
-            RF_SERIAL.print(gx,4); RF_SERIAL.print(','); RF_SERIAL.print(gy,4); RF_SERIAL.print(','); RF_SERIAL.print(gz,4); RF_SERIAL.print(',');
-            RF_SERIAL.print(mx,2); RF_SERIAL.print(','); RF_SERIAL.print(my,2); RF_SERIAL.print(','); RF_SERIAL.print(mz,2);
-        }else{
+        if (ok.bno055) {
+            RF_SERIAL.print(ax,3); RF_SERIAL.print(',');
+            RF_SERIAL.print(ay,3); RF_SERIAL.print(',');
+            RF_SERIAL.print(az,3); RF_SERIAL.print(',');
+            RF_SERIAL.print(gx,4); RF_SERIAL.print(',');
+            RF_SERIAL.print(gy,4); RF_SERIAL.print(',');
+            RF_SERIAL.print(gz,4); RF_SERIAL.print(',');
+            RF_SERIAL.print(mx,2); RF_SERIAL.print(',');
+            RF_SERIAL.print(my,2); RF_SERIAL.print(',');
+            RF_SERIAL.print(mz,2);
+        } else {
             RF_SERIAL.print(F("N,N,N,N,N,N,N,N,N"));
         }
         RF_SERIAL.print(',');
 
-        if(ok.bme280){
-            RF_SERIAL.print(bme_tk,1); RF_SERIAL.print(','); RF_SERIAL.print(bme_p,1); RF_SERIAL.print(',');
-            RF_SERIAL.print(bme_h,1); RF_SERIAL.print(','); RF_SERIAL.print(bme_ak,1);
+        if (ok.bme280) {
+            RF_SERIAL.print(bme_tk,1); RF_SERIAL.print(',');
+            RF_SERIAL.print(bme_p,1); RF_SERIAL.print(',');
+            RF_SERIAL.print(bme_h,1); RF_SERIAL.print(',');
+            RF_SERIAL.print(bme_ak,1);
         } else {
             RF_SERIAL.print(F("N,N,N,N"));
         }
         RF_SERIAL.print(',');
 
-        if(ok.aht20 && !isnan(aht_t)){
-            RF_SERIAL.print(aht_t,1); RF_SERIAL.print(','); RF_SERIAL.print(aht_h,1);
-        }else{
+        if (ok.aht20 && !isnan(aht_t)) {
+            RF_SERIAL.print(aht_t,1); RF_SERIAL.print(',');
+            RF_SERIAL.print(aht_h,1);
+        } else {
             RF_SERIAL.print(F("N,N"));
         }
         RF_SERIAL.print(',');
 
-        if(ok.gps_fix){
-            RF_SERIAL.print(gps.lat,6); RF_SERIAL.print(','); RF_SERIAL.print(gps.lon,6); RF_SERIAL.print(',');
-            RF_SERIAL.print(gps.altitude,1); RF_SERIAL.print(','); RF_SERIAL.print(gps.speed,2); RF_SERIAL.print(','); RF_SERIAL.print(gps.course,1);
+        if (ok.gps_fix) {
+            RF_SERIAL.print(gps.lat,6); RF_SERIAL.print(',');
+            RF_SERIAL.print(gps.lon,6); RF_SERIAL.print(',');
+            RF_SERIAL.print(gps.altitude,1); RF_SERIAL.print(',');
+            RF_SERIAL.print(gps.speed,2); RF_SERIAL.print(',');
+            RF_SERIAL.print(gps.course,1);
         } else {
             RF_SERIAL.print(F("N,N,N,N,N"));
         }
         RF_SERIAL.print(',');
 
-        RF_SERIAL.print(mad_roll,2); RF_SERIAL.print(','); RF_SERIAL.print(mad_pitch,2); RF_SERIAL.print(','); RF_SERIAL.print(mad_yaw,2);
+        RF_SERIAL.print(mad_roll,2); RF_SERIAL.print(',');
+        RF_SERIAL.print(mad_pitch,2); RF_SERIAL.print(',');
+        RF_SERIAL.print(mad_yaw,2);
         RF_SERIAL.print(','); RF_SERIAL.print(altvel.rel_alt,2);
         RF_SERIAL.print(','); RF_SERIAL.print(altvel.vel,2);
         RF_SERIAL.print(','); RF_SERIAL.print(altvel.g_force,3);
         RF_SERIAL.print(','); RF_SERIAL.print(altvel.dpdt,3);
-        RF_SERIAL.print(','); RF_SERIAL.print(rf_armed()?1:0);
+        RF_SERIAL.print(','); RF_SERIAL.print(rf_armed() ? 1 : 0);
         RF_SERIAL.print(','); RF_SERIAL.print((int)flight.state_code());
         RF_SERIAL.print(','); RF_SERIAL.print(flight.throttle());
         RF_SERIAL.println();
