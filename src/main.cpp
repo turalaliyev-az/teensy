@@ -50,8 +50,6 @@ void esc_write_us(uint16_t us) {
 }
 
 // ======================== RF EMRLERI (Ehtiyat kilidi) ========================
-// DEFAULT: ARMED (sistem avtomatik hazirdir, ARM emri lazim deyil)
-// '0' = DISARM (ehtiyat kilidi), '1' = ARM (yeniden aktiv)
 static bool _armed = true;
 static bool _last_ack = true;
 
@@ -79,7 +77,7 @@ bool rf_armed() {
     return _armed;
 }
 
-// ======================== HUNDURLUK + SURET (IMU + BARO fusion) ========================
+// ======================== HUNDURLUK + SURET ========================
 struct AltVel {
     float rel_alt;
     float vel;
@@ -99,9 +97,7 @@ private:
     float _g_smooth;
     uint32_t _last_us;
     bool _have_prev;
-
     float _P00, _P01, _P11;
-
     uint32_t _calib_start_ms;
     float _calib_sum;
     uint32_t _calib_count;
@@ -166,7 +162,6 @@ void AltVel::update(float pressure_hpa, float az, float ax, float ay, bool imu_o
     _prev_p = _p_smooth;
     dpdt = _dpdt_smooth;
 
-    // Boot kalibrasiyasi (yalniz baslangicda, ARM/DISARM-dan asili deyil)
     if (!_calibrated) {
         if (_calib_start_ms == 0) _calib_start_ms = millis();
         _calib_sum += pressure_hpa;
@@ -251,7 +246,6 @@ void FlightCtrl::update(bool armed, bool level_ok, bool descending, float rel_al
     }
     _last_ms = now_ms;
 
-    // DISARM = EHTIYAT KILIDI: Motorlar hec vaxt islemir
     if (!armed) {
         state = FS_DISARMED;
         throttle_us = (float)ESC_US_OFF;
@@ -259,17 +253,12 @@ void FlightCtrl::update(bool armed, bool level_ok, bool descending, float rel_al
         return;
     }
 
-    // ARMED: Sistem avtomatik islemeye hazirdir
     if (state == FS_DISARMED) {
         state = FS_ARMED;
         throttle_us = (float)ESC_US_OFF;
     }
 
     if (state == FS_ARMED) {
-        // Avtomatik ise dusme sertleri:
-        // 1. level_ok: Roll/Pitch <= +-5 derece
-        // 2. descending: vel < 0 (asagi duser)
-        // 3. rel_alt <= 500m
         if (level_ok && descending && (rel_alt <= ALT_TRIGGER_M)) {
             state = FS_MOTORS_ON;
         }
@@ -281,7 +270,6 @@ void FlightCtrl::update(bool armed, bool level_ok, bool descending, float rel_al
             return;
         }
 
-        // Pille-pille artma: 1000 -> 1480, 500ms
         if (throttle_us < (float)ESC_US_RUN) {
             throttle_us += RAMP_STEP_US * (float)dt_ms;
             if (throttle_us > (float)ESC_US_RUN) {
@@ -504,6 +492,8 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define LED_PIN         13
 #define RF_SERIAL       Serial2
 #define RF_BAUD         115200
+// Serial7: Teensy 4.1 pin 0 = RX7, pin 1 = TX7
+// GPS-in TX pinini Teensy pin 0-a (RX7), GPS-in RX pinini Teensy pin 1-e (TX7) qosun
 #define GPS_SERIAL      Serial7
 #define GPS_BAUD        9600
 #define I2C_FREQ        400000UL
@@ -514,9 +504,10 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define PRINT_PERIOD    200
 #define RF_PERIOD       66
 #define FLIGHT_PERIOD   10
+#define GPS_DEBUG_PERIOD 5000   // Xam NMEA debug cixisi (5 saniyede bir)
 #define SEA_LEVEL_HPA   1013.25f
 
-// ======================== GPS ========================
+// ======================== GPS (UNIVERSAL NMEA PARSER) ========================
 static float nmea_to_decimal(float ddmm) {
     int deg = (int)(ddmm / 100.0f);
     float min = ddmm - (float)(deg * 100);
@@ -527,56 +518,119 @@ struct GPSData {
     float lat, lon, altitude, speed, course;
     uint8_t fix, satellites;
     bool updated;
-    GPSData() : lat(0),lon(0),altitude(0),speed(0),course(0),fix(0),satellites(0),updated(false) {}
+    uint32_t msg_count;    // YENI: nece NMEA mesaj alinib
+    uint32_t last_msg_ms;  // YENI: son mesaj vaxti
+    GPSData() : lat(0),lon(0),altitude(0),speed(0),course(0),fix(0),satellites(0),updated(false),msg_count(0),last_msg_ms(0) {}
 };
 static GPSData gps;
 static char gps_buf[128];
 static uint8_t gps_idx = 0;
 
-static void gps_parse_gpgga(char*s){
-    char*p=s;
-    for(int i=0;i<1;i++){p=strchr(p,',');if(!p)return;p++;}
-    float lat_raw=strtof(p,&p);if(!p||*p!=',')return;p++;
-    if(*p=='S')lat_raw=-lat_raw;
-    p=strchr(p,',');if(!p)return;p++;
-    float lon_raw=strtof(p,&p);if(!p||*p!=',')return;p++;
-    if(*p=='W')lon_raw=-lon_raw;
-    p=strchr(p,',');if(!p)return;p++;
-    int fix=(int)strtol(p,&p,10);if(!p||*p!=',')return;p++;
-    int sats=(int)strtol(p,&p,10);if(!p)return;
-    for(int i=0;i<2;i++){p=strchr(p,',');if(!p)return;p++;}
-    float alt=strtof(p,&p);
-    gps.lat=nmea_to_decimal(fabsf(lat_raw))*(lat_raw<0?-1:1);
-    gps.lon=nmea_to_decimal(fabsf(lon_raw))*(lon_raw<0?-1:1);
-    gps.altitude=alt;gps.fix=(uint8_t)fix;gps.satellites=(uint8_t)sats;gps.updated=true;
+// YENI: Universal NMEA tipi yoxlama
+// $GPGGA, $GNGGA, $GLGGA, $GAGGA, $BDGGA ... hamisini taniyir
+static bool nmea_is_type(const char* buf, const char* suffix) {
+    // buf: "$GPGGA,..." veya "$GNGGA,..."
+    // suffix: "GGA" ve ya "RMC"
+    if (buf[0] != '$') return false;
+    // 3-cu simvoldan (index 3) sonra 3 herf suffix ile eyni olmalidir
+    // $ G P G G A , -> index: 0 1 2 3 4 5 6
+    // suffix "GGA" index 3,4,5-de yerlesir
+    if (strlen(buf) < 7) return false;
+    return (buf[3] == suffix[0] && buf[4] == suffix[1] && buf[5] == suffix[2]);
 }
 
-static void gps_parse_gprmc(char*s){
+static void gps_parse_gga(char*s){
     char*p=s;
-    for(int i=0;i<1;i++){p=strchr(p,',');if(!p)return;p++;}
-    p=strchr(p,',');if(!p)return;p++;
-    if(*p!='A')return;
+    // $G?GGA,time,lat,N/S,lon,E/W,fix,sats,...,alt,...
+    // 1-ci vergulu kec (time sahesine dusur)
+    p=strchr(p,','); if(!p)return; p++;
+    // time sahesini kec (bos ola biler)
+    float lat_raw=strtof(p,&p);
+    if(*p!=',')return; p++;
+    if(*p=='S')lat_raw=-lat_raw;
+    if(*p!=',')return; p++;  // N/S sahesini kec
+    float lon_raw=strtof(p,&p);
+    if(*p!=',')return; p++;
+    if(*p=='W')lon_raw=-lon_raw;
+    if(*p!=',')return; p++;  // E/W sahesini kec
+    int fix=(int)strtol(p,&p,10);
+    if(*p!=',')return; p++;
+    int sats=(int)strtol(p,&p,10);
+    // 2 sahe kec (HDOP, geoid)
+    for(int i=0;i<2;i++){p=strchr(p,',');if(!p)return;p++;}
+    float alt=strtof(p,&p);
+
+    if (lat_raw != 0.0f || lon_raw != 0.0f) {
+        gps.lat=nmea_to_decimal(fabsf(lat_raw))*(lat_raw<0?-1:1);
+        gps.lon=nmea_to_decimal(fabsf(lon_raw))*(lon_raw<0?-1:1);
+    }
+    gps.altitude=alt;
+    gps.fix=(uint8_t)fix;
+    gps.satellites=(uint8_t)sats;
+    gps.updated=true;
+}
+
+static void gps_parse_rmc(char*s){
+    char*p=s;
+    // $G?RMC,time,status,lat,N/S,lon,E/W,speed,course,...
+    p=strchr(p,','); if(!p)return; p++;  // time
+    p=strchr(p,','); if(!p)return; p++;  // status (A/V)
+    if(*(p-1)!='A' && *p!='A') {
+        // status V = void (fix yoxdur), ama yine de davam edek
+    }
+    // 4 sahe kec (lat, N/S, lon, E/W)
     for(int i=0;i<4;i++){p=strchr(p,',');if(!p)return;p++;}
-    float spd=strtof(p,&p);if(!p||*p!=',')return;p++;
+    float spd=strtof(p,&p);
+    if(*p!=',')return; p++;
     float crs=strtof(p,&p);
-    gps.speed=spd*0.514444f;gps.course=crs;
+    gps.speed=spd*0.514444f;  // knots -> m/s
+    gps.course=crs;
 }
 
 static void gps_read(){
     while(GPS_SERIAL.available()){
         char c=GPS_SERIAL.read();
         if(c=='$'){
-            gps_idx=0;gps_buf[0]='$';gps_buf[1]=0;
+            gps_idx=0;
+            gps_buf[0]='$';
+            gps_buf[1]=0;
         }
-        else if(c=='\n'){
-            gps_buf[gps_idx]=0;
-            if(strncmp(gps_buf,"$GPGGA",6)==0)gps_parse_gpgga(gps_buf);
-            else if(strncmp(gps_buf,"$GPRMC",6)==0)gps_parse_gprmc(gps_buf);
+        else if(c=='\n' || c=='\r'){
+            if(gps_idx > 6){
+                gps_buf[gps_idx]=0;
+                gps.msg_count++;
+                gps.last_msg_ms = millis();
+                // UNIVERSAL YOXLAMA: istenilen prefiks ($GP, $GN, $GL, $GA, $BD...)
+                if(nmea_is_type(gps_buf, "GGA")) {
+                    gps_parse_gga(gps_buf);
+                }
+                else if(nmea_is_type(gps_buf, "RMC")) {
+                    gps_parse_rmc(gps_buf);
+                }
+            }
             gps_idx=0;
         }
         else if(gps_idx<127){
-            gps_buf[gps_idx++]=c;gps_buf[gps_idx]=0;
+            gps_buf[gps_idx++]=c;
+            gps_buf[gps_idx]=0;
         }
+    }
+}
+
+// YENI: GPS diaqnostika (xam NMEA cixisi)
+static void gps_debug_dump(){
+    Serial.print(F("[GPS] msgs=")); Serial.print(gps.msg_count);
+    Serial.print(F(" fix=")); Serial.print(gps.fix);
+    Serial.print(F(" sats=")); Serial.print(gps.satellites);
+    Serial.print(F(" lat=")); Serial.print(gps.lat, 5);
+    Serial.print(F(" lon=")); Serial.print(gps.lon, 5);
+    Serial.print(F(" alt=")); Serial.print(gps.altitude, 1);
+    if (gps.msg_count == 0) {
+        Serial.println(F("  << GPS-DEN MESAJ YOXDUR! (Baud/Naqil yoxlayin)"));
+    } else if (gps.fix == 0) {
+        Serial.println(F("  << MESAJ VAR, AMA FIX YOXDUR (Acik sema lazimdir)"));
+    } else {
+        Serial.println(F("  << OK"));
     }
 }
 
@@ -591,7 +645,7 @@ struct Kalman1D {
 static struct{uint8_t bno055:1,bme280:1,aht20:1,gps_fix:1;} ok;
 static AttitudeEKF ekf;
 static Kalman1D kalmanTemp,kalmanAlt;
-static uint32_t lastBno,lastBme,lastAht,lastGps,lastPrn,lastRf;
+static uint32_t lastBno,lastBme,lastAht,lastGps,lastPrn,lastRf,lastGpsDbg;
 static uint32_t lastFlight;
 static AltVel altvel;
 static FlightCtrl flight;
@@ -669,7 +723,8 @@ void setup(){
 
     // GPS
     GPS_SERIAL.begin(GPS_BAUD);
-    Serial.print(F("GPS:    Serial7 @ ")); Serial.print(GPS_BAUD); Serial.println(F(" baud"));
+    Serial.print(F("GPS:    Serial7 @ ")); Serial.print(GPS_BAUD); Serial.println(F(" baud (pin0=RX, pin1=TX)"));
+    Serial.println(F("[GPS] 5 saniye sonra diaqnostika cixacaq..."));
 
     // EKF
     ekf.init(0.0f, 0.0f, 9.80665f);
@@ -678,7 +733,7 @@ void setup(){
     Serial.print(F("[RF] Serial2 @ ")); Serial.print(RF_BAUD); Serial.print(F(" baud, Header: ")); Serial.println(DEVICE_HEADER);
 
     uint32_t now=millis();
-    lastBno=lastBme=lastAht=lastGps=lastPrn=lastRf=now;
+    lastBno=lastBme=lastAht=lastGps=lastPrn=lastRf=lastGpsDbg=now;
     lastFlight=now;
     digitalWrite(LED_PIN,LOW);
 }
@@ -687,6 +742,9 @@ void setup(){
 void loop(){
     uint32_t now=millis();
     rf_command_update();
+
+    // GPS-i DAİM oxu (buffer overflow olmasin deye her loop-da)
+    gps_read();
 
     // Ucus Nezaretcisi (100 Hz)
     if(now-lastFlight>=FLIGHT_PERIOD){
@@ -751,11 +809,20 @@ void loop(){
         aht_h = humidity.relative_humidity;
     }
 
-    // GPS
-    gps_read();
+    // GPS status yenileme (5 Hz)
     if(now-lastGps>=GPS_PERIOD){
         lastGps=now;
         ok.gps_fix=(gps.fix>0);
+        // Eger 3 saniyede hec mesaj gelmeyibse, GPS-itileshme itirilib
+        if (gps.msg_count > 0 && (now - gps.last_msg_ms) > 3000) {
+            ok.gps_fix = false;
+        }
+    }
+
+    // GPS Debug Diaqnostika (5 saniyede bir)
+    if(now-lastGpsDbg>=GPS_DEBUG_PERIOD){
+        lastGpsDbg=now;
+        gps_debug_dump();
     }
 
     // Status LED
@@ -785,8 +852,8 @@ void loop(){
         else { Serial.print(F("OFF")); }
 
         Serial.print(F(" | GPS:"));
-        if(ok.gps_fix){ Serial.print(gps.lat,5); Serial.print(','); Serial.print(gps.lon,5); }
-        else { Serial.print(F("NO")); }
+        if(ok.gps_fix){ Serial.print(gps.lat,5); Serial.print(','); Serial.print(gps.lon,5); Serial.print(F(" sat:")); Serial.print(gps.satellites); }
+        else { Serial.print(F("NO(msg:")); Serial.print(gps.msg_count); Serial.print(F(")")); }
 
         Serial.print(F(" | FLT:"));
         Serial.print(rf_armed()?F("ARM"):F("DISARM"));
