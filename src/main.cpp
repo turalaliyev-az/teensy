@@ -10,6 +10,14 @@
 
 #include <TinyGPS++.h>
 
+// ======================== FORWARD DECLARATIONS ========================
+void esc_init();
+void esc_write_us(uint16_t us);
+void esc_write_us(uint16_t us1, uint16_t us2);
+void rf_command_init();
+void rf_command_update();
+bool rf_armed();
+
 // ======================== SENSOR OBYEKTLERI ========================
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 Adafruit_BME280 bme;
@@ -17,6 +25,7 @@ Adafruit_AHTX0 aht;
 
 static TinyGPSPlus tgps;
 
+// ======================== GPS DATA ========================
 struct GPSData {
     float lat, lon, altitude, speed, course;
     uint8_t fix, satellites;
@@ -40,12 +49,14 @@ static uint32_t us_to_duty(uint16_t us) {
     return (uint32_t)us * 65536UL / 20000UL;
 }
 
+void esc_write_us(uint16_t us1, uint16_t us2) {
+    analogWrite(ESC1_PIN, us_to_duty(us1));
+    analogWrite(ESC2_PIN, us_to_duty(us2));
+}
 
-
-
-// İleri bildirimler: esc_init() bunları tanımdan önce kullanır
-void esc_write_us(uint16_t us1, uint16_t us2);
-void esc_write_us(uint16_t us);
+void esc_write_us(uint16_t us) {
+    esc_write_us(us, us);
+}
 
 void esc_init() {
     pinMode(ESC1_PIN, OUTPUT);
@@ -54,15 +65,6 @@ void esc_init() {
     analogWriteFrequency(ESC2_PIN, ESC_PWM_FREQ);
     analogWriteResolution(16);
     esc_write_us(ESC_US_OFF);
-}
-
-void esc_write_us(uint16_t us1, uint16_t us2) {
-    analogWrite(ESC1_PIN, us_to_duty(us1));
-    analogWrite(ESC2_PIN, us_to_duty(us2));
-}
-
-void esc_write_us(uint16_t us) {
-    esc_write_us(us, us);
 }
 
 // ======================== RF EMRLERI ========================
@@ -749,7 +751,10 @@ void AttitudeEKF::update(float ax, float ay, float az) {
 
 void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
     roll  = atan2f(2.0f*(q[0]*q[1] + q[2]*q[3]), 1.0f - 2.0f*(q[1]*q[1] + q[2]*q[2])) * RAD2DEG;
-    pitch = asinf(2.0f*(q[0]*q[2] - q[3]*q[1])) * RAD2DEG;
+    float sp = 2.0f*(q[0]*q[2] - q[3]*q[1]);
+    if (sp > 1.0f) sp = 1.0f;
+    if (sp < -1.0f) sp = -1.0f;
+    pitch = asinf(sp) * RAD2DEG;
     yaw   = atan2f(2.0f*(q[0]*q[3] + q[1]*q[2]), 1.0f - 2.0f*(q[2]*q[2] + q[3]*q[3])) * RAD2DEG;
 }
 
@@ -770,9 +775,9 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define RF_PERIOD       66
 #define FLIGHT_PERIOD   10
 #define GPS_DEBUG_PERIOD 5000
-#define I2C_CHECK_PERIOD 1000   // 3s -> 1s (daha tez yoxlama)
+#define I2C_CHECK_PERIOD 1000
 #define SEA_LEVEL_HPA   1013.25f
-#define BNO_FAIL_THRESHOLD 50   // 50 uğursuz oxuma = recovery
+#define BNO_FAIL_THRESHOLD 50
 
 // ======================== BINARY RF PROTOCOL ========================
 #define RF_PKT_SYNC1        0xAA
@@ -1010,7 +1015,7 @@ static float mad_roll,mad_pitch,mad_yaw;
 static uint32_t lastEkf_us = 0;
 static uint8_t last_flight_state = 255;
 
-// YENİ: BNO055 data validasiyası
+// BNO055 data validasiyası
 static uint8_t bno_fail_count = 0;
 static bool bno_data_valid = false;
 
@@ -1034,7 +1039,7 @@ static void i2c_recovery() {
     delay(20);
     Wire.begin();
     Wire.setClock(I2C_FREQ);
-    Wire.setTimeout(100);  // DÜZƏLİŞ: 3ms -> 100ms
+    Wire.setTimeout(100);
     delay(20);
     
     if (ok.bno055) { bno.begin(); bno.setExtCrystalUse(false); }
@@ -1060,7 +1065,7 @@ void setup() {
     Serial.println(F("\n=== TEENSY 4.1 " DEVICE_NAME " ==="));
     Serial.println(F("[REJIM] 5000m + Enish + +-5Derece -> ESC 1480us"));
     Serial.println(F("[RF] Binary (0xCC) | ARM_ON, ARM_OFF"));
-    Serial.println(F("[YENİ] Impact + High-G (14G) + BNO data validasiya"));
+    Serial.println(F("[SENSOR] Impact + High-G (14G) + BNO validasiya"));
 
     rf_command_init();
     altvel.init();
@@ -1072,7 +1077,6 @@ void setup() {
 
     Wire.begin();
     Wire.setClock(I2C_FREQ);
-    // DÜZƏLİŞ: 3ms -> 100ms (BNO055 üçün kifayət qədər vaxt)
     Wire.setTimeout(100);
     Serial.print(F("[I2C] ")); Serial.print(I2C_FREQ/1000); Serial.println(F(" kHz, timeout=100ms"));
 
@@ -1147,7 +1151,6 @@ void loop() {
     if (now - lastI2cCheck >= I2C_CHECK_PERIOD) {
         lastI2cCheck = now;
         
-        // YENİ: BNO055 data validasiyası
         if (ok.bno055 && bno_fail_count > BNO_FAIL_THRESHOLD) {
             Serial.println(F("[BNO] Çoxlu uğursuz oxuma - recovery"));
             bno_recovery();
@@ -1192,7 +1195,6 @@ void loop() {
             float new_ay = event.acceleration.y;
             float new_az = event.acceleration.z;
             
-            // YENİ: Data validasiyası
             bool data_ok = true;
             if (isnan(new_ax) || isinf(new_ax) || new_ax == 0.0f) data_ok = false;
             if (isnan(new_ay) || isinf(new_ay)) data_ok = false;
