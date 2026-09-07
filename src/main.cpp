@@ -56,7 +56,6 @@ static GPSData gps;
 #define ESC_US_OFF      1000
 #define ESC_US_RUN      1480
 
-// Saniyədə nə qədər PWM artsın? (250.0f -> 1.9 saniyəyə tam güc)
 #define ESC_SLEW_RATE_US_PER_S 250.0f 
 
 void esc_init();
@@ -78,11 +77,9 @@ void esc_init() {
     esc_write_us(ESC_US_OFF, ESC_US_OFF);
 }
 
-// Qoruyuculu xətti artım (Linear Ramp) funksiyası
 void esc_update_target(float target_us1, float target_us2, float dt) {
     float step = ESC_SLEW_RATE_US_PER_S * dt;
     
-    // ESC 1 Məntiqi: Kəsim varsa ANINDA sön!
     if (target_us1 <= ESC_US_OFF) {
         _current_esc1_us = ESC_US_OFF;
     } else {
@@ -90,7 +87,6 @@ void esc_update_target(float target_us1, float target_us2, float dt) {
         else _current_esc1_us = fmaxf(_current_esc1_us - step, target_us1);
     }
 
-    // ESC 2 Məntiqi: Kəsim varsa ANINDA sön!
     if (target_us2 <= ESC_US_OFF) {
         _current_esc2_us = ESC_US_OFF;
     } else {
@@ -305,21 +301,18 @@ void AttitudeEKF::update(float ax, float ay, float az) {
     updateVectorMeasurement(meas, (const float[]){0.0f, 0.0f, 1.0f}, 0.003f + 2.0f * dev * dev);
 }
 
-// XƏTA 1 HƏLLİ: Doğru Üfüqi Proyeksiya (Z oxu əvəzinə Y oxu)
 void AttitudeEKF::updateMag(float mx, float my, float mz) {
     float mmag = sqrtf(mx*mx + my*my + mz*mz);
     if (mmag < 15.0f || mmag > 120.0f) return;
     _mag_norm_ref = (_mag_norm_ref <= 1.0f) ? mmag : _mag_norm_ref + 0.02f * (mmag - _mag_norm_ref);
     if (fabsf(mmag - _mag_norm_ref) / _mag_norm_ref > 0.45f) return;
 
-    float meas[3] = {mx / mmag, my / mmag, mz / mmag}, m_world[3]; 
-    quat_rotate_vec(q, meas, m_world);
+    float meas[3] = {mx / mmag, my / mmag, mz / mmag}, m_world[3]; quat_rotate_vec(q, meas, m_world);
     
-    // Z şaqulidir, Üfüqi müstəvi X və Y-dir
+    // Doğru Üfüqi Proyeksiya (Z oxu əvəzinə Y oxu)
     float norm_ref = sqrtf(m_world[0]*m_world[0] + m_world[1]*m_world[1]);
     if (norm_ref < 0.2f) return;
 
-    // Yalnız Z-i sıfırlayırıq
     float ref_raw[3] = {m_world[0] / norm_ref, m_world[1] / norm_ref, 0.0f};
     
     if (!_mag_ref_valid) { memcpy(_mag_ref, ref_raw, sizeof(_mag_ref)); _mag_ref_valid = true; } 
@@ -375,6 +368,7 @@ void AttitudeEKF::updateVectorMeasurement(const float meas[3], const float ref[3
     memcpy(P, Pnew, sizeof(P)); symmetrize();
 }
 
+#define RAD2DEG 57.2957795f
 void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
     roll  = atan2f(2.0f*(q[0]*q[1] + q[2]*q[3]), 1.0f - 2.0f*(q[1]*q[1] + q[2]*q[2])) * RAD2DEG;
     pitch = asinf(fmaxf(fminf(2.0f*(q[0]*q[2] - q[3]*q[1]), 1.0f), -1.0f)) * RAD2DEG;
@@ -421,10 +415,7 @@ struct FlightCtrl {
             if (vel < -1.0f && (max_alt - rel_alt > 2.0f)) state = FS_DESCENDING;
         } 
         else if (state == FS_DESCENDING) {
-            // Qoruyucu 1: Yerdən 1m qalıbsa (düz yerə eniş)
             if (rel_alt <= 1.0f) state = FS_LANDED;
-            
-            // Qoruyucu 2: Ağaca və ya yüksək yerə eniş (2.5 saniyə hərəkətsizlik)
             if (fabsf(vel) < 0.3f) { 
                 if (landing_steady_start == 0) landing_steady_start = now;
                 else if (now - landing_steady_start > 2500UL) state = FS_LANDED;
@@ -434,7 +425,6 @@ struct FlightCtrl {
         if (state == FS_DESCENDING) {
             if (tilt_hysteresis_ok) {
                 target_esc1 = ESC_US_RUN;
-                
                 if (esc1_active_start_time == 0) esc1_active_start_time = now;
 
                 if (esc1_active_start_time != 0 && (now - esc1_active_start_time >= 1000)) {
@@ -443,7 +433,7 @@ struct FlightCtrl {
 
             } else {
                 target_esc1 = ESC_US_OFF; target_esc2 = ESC_US_OFF;
-                esc1_active_start_time = 0; // Aşma anında taymeri SIFIRLA!
+                esc1_active_start_time = 0; 
             }
         } else {
             target_esc1 = ESC_US_OFF; target_esc2 = ESC_US_OFF;
@@ -459,7 +449,9 @@ struct FlightCtrl {
 // ======================== GLOBAL ========================
 static struct { uint8_t bno055:1, bme280:1, aht20:1, gps_fix:1; } ok;
 static AttitudeEKF ekf; static AltVel altvel; static FlightCtrl flight;
-static float ax,ay,az,gx,gy,gz,mx,my,mz, bme_t,bme_p,bme_h,bme_a, aht_t,aht_h;
+// 'aht_t' və 'aht_h' telemetriyada istifadə olunmadığı üçün silindi və ya lazımdırsa telemetriya paketinə daxil edilə bilər.
+// Hal-hazırda təmizləmək üçün onlara ehtiyac yoxdur.
+static float ax,ay,az,gx,gy,gz,mx,my,mz, bme_t,bme_p,bme_h,bme_a; 
 static float mad_roll,mad_pitch,mad_yaw, fast_g = 1.0f;
 static bool fast_g_valid = false;
 
@@ -506,9 +498,11 @@ static uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
 }
 static void put_u8(uint8_t* buf, size_t &idx, uint8_t v) { buf[idx++] = v; }
 static void put_u16(uint8_t* buf, size_t &idx, uint16_t v) { memcpy(buf + idx, &v, sizeof(v)); idx += sizeof(v); }
-static void put_i16(uint8_t* buf, size_t &idx, int16_t v) { memcpy(buf + idx, &v, sizeof(v)); idx += sizeof(v); }
 static void put_u32(uint8_t* buf, size_t &idx, uint32_t v) { memcpy(buf + idx, &v, sizeof(v)); idx += sizeof(v); }
-static void put_i32(uint8_t* buf, size_t &idx, int32_t v) { memcpy(buf + idx, &v, sizeof(v)); idx += sizeof(v); }
+
+// Lazım olmayan xəbərdarlıq funksiyaları kommentə alındı
+// static void put_i16(uint8_t* buf, size_t &idx, int16_t v) { memcpy(buf + idx, &v, sizeof(v)); idx += sizeof(v); }
+// static void put_i32(uint8_t* buf, size_t &idx, int32_t v) { memcpy(buf + idx, &v, sizeof(v)); idx += sizeof(v); }
 
 static void rf_write_packet(uint8_t type, const uint8_t* payload, uint8_t len) {
     uint8_t buf[128]; size_t i = 0; if (len > sizeof(buf) - 14) len = sizeof(buf) - 14;
@@ -573,7 +567,6 @@ void loop(){
         float tilt = fmaxf(fabsf(mad_roll), fabsf(mad_pitch));
         uint8_t old_state = flight.state_code();
         
-        // Flight Update (Möhkəmləndirilmiş relyef məntiqi ilə)
         flight.update(altvel.rel_alt, altvel.vel, tilt, dt_flt, now);
         
         if (old_state != flight.state_code()) {
