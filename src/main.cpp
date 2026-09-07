@@ -18,9 +18,11 @@ static TinyGPSPlus tgps;
 
 // ======================== GPS OBYEKTI ========================
 struct GPSData {
-    float lat, lon, altitude, speed, course;
+    // SƏNAYE STANDARTI: Koordinatlar dəqiqlik itməməsi üçün mütləq double olmalıdır!
+    double lat, lon; 
+    float altitude, speed, course;
     uint8_t fix, satellites;
-    GPSData() : lat(0),lon(0),altitude(0),speed(0),course(0),fix(0),satellites(0) {}
+    GPSData() : lat(0.0),lon(0.0),altitude(0.0f),speed(0.0f),course(0.0f),fix(0),satellites(0) {}
 };
 static GPSData gps;
 
@@ -56,13 +58,14 @@ static GPSData gps;
 #define ESC_US_OFF      1000
 #define ESC_US_RUN      1480
 
-// Saniyədə nə qədər PWM artsın?
+// Saniyədə nə qədər PWM artsın/azalsın?
 #define ESC_SLEW_RATE_US_PER_S 250.0f 
 
 void esc_init();
 void esc_write_us(float us1, float us2);
 static float _current_esc1_us = ESC_US_OFF;
 static float _current_esc2_us = ESC_US_OFF;
+static bool _armed = true;
 
 static uint32_t us_to_duty(float us) {
     us = fmaxf(fminf(us, ESC_US_MAX), ESC_US_MIN);
@@ -79,21 +82,27 @@ void esc_init() {
 }
 
 void esc_update_target(float target_us1, float target_us2, float dt) {
-    float step = ESC_SLEW_RATE_US_PER_S * dt;
-    
-    if (target_us1 <= ESC_US_OFF) {
+    if (!_armed) {
         _current_esc1_us = ESC_US_OFF;
-    } else {
-        if (target_us1 > _current_esc1_us) _current_esc1_us = fminf(_current_esc1_us + step, target_us1);
-        else _current_esc1_us = fmaxf(_current_esc1_us - step, target_us1);
-    }
-
-    if (target_us2 <= ESC_US_OFF) {
         _current_esc2_us = ESC_US_OFF;
     } else {
-        if (target_us2 > _current_esc2_us) _current_esc2_us = fminf(_current_esc2_us + step, target_us2);
-        else _current_esc2_us = fmaxf(_current_esc2_us - step, target_us2);
+        float step = ESC_SLEW_RATE_US_PER_S * dt;
+        
+        if (target_us1 > _current_esc1_us) {
+            _current_esc1_us = fminf(_current_esc1_us + step, target_us1);
+        } else {
+            _current_esc1_us = fmaxf(_current_esc1_us - step, target_us1);
+        }
+
+        if (target_us2 > _current_esc2_us) {
+            _current_esc2_us = fminf(_current_esc2_us + step, target_us2);
+        } else {
+            _current_esc2_us = fmaxf(_current_esc2_us - step, target_us2);
+        }
     }
+
+    if (_current_esc1_us <= ESC_US_OFF + 0.1f) _current_esc1_us = ESC_US_OFF;
+    if (_current_esc2_us <= ESC_US_OFF + 0.1f) _current_esc2_us = ESC_US_OFF;
 
     analogWrite(ESC1_PIN, us_to_duty(_current_esc1_us));
     analogWrite(ESC2_PIN, us_to_duty(_current_esc2_us));
@@ -106,8 +115,6 @@ void esc_write_us(float us1, float us2) {
 }
 
 // ======================== RF EMRLERI ========================
-static bool _armed = true;
-
 void rf_command_update() {
     uint8_t reads = 0;
     while (Serial2.available() && reads++ < MAX_UART_READS) {
@@ -116,10 +123,7 @@ void rf_command_update() {
         else if (c == '0') _armed = false;
     }
 }
-
-bool rf_armed() {
-    return _armed;
-}
+bool rf_armed() { return _armed; }
 
 // ======================== BNO055 EEPROM ========================
 #define BNO_CAL_EEPROM_ADDR   0
@@ -260,7 +264,8 @@ void AttitudeEKF::init(float ax, float ay, float az) {
     else if (d < -0.999999f) { q[0]=0.0f; q[1]=1.0f; q[2]=q[3]=0.0f; } 
     else {
         float ang = acosf(d); float s = sinf(ang * 0.5f);
-        float an = fmaxf(sqrtf(ay*ay + ax*ax), 1e-8f);
+        float an = sqrtf(ay*ay + ax*ax);
+        if (an < 1e-8f) an = 1e-8f; 
         q[0] = cosf(ang * 0.5f); q[1] = s * ay / an; q[2] = s * -ax / an; q[3] = 0.0f;
     }
     b[0] = b[1] = b[2] = 0.0f; memset(P, 0, sizeof(P));
@@ -314,7 +319,6 @@ void AttitudeEKF::updateMag(float mx, float my, float mz) {
 
     float meas[3] = {mx / mmag, my / mmag, mz / mmag}, m_world[3]; quat_rotate_vec(q, meas, m_world);
     
-    // Doğru Üfüqi Proyeksiya (Z oxu əvəzinə Y oxu)
     float norm_ref = sqrtf(m_world[0]*m_world[0] + m_world[1]*m_world[1]);
     if (norm_ref < 0.2f) return;
 
@@ -331,7 +335,10 @@ void AttitudeEKF::updateMag(float mx, float my, float mz) {
 }
 
 void AttitudeEKF::symmetrize() {
-    for (int i=0; i<7; i++) if (isnan(P[i][i]) || isinf(P[i][i]) || P[i][i] < 1e-12f) P[i][i] = 1e-12f;
+    for (int i=0; i<7; i++) {
+        if (isnan(P[i][i]) || isinf(P[i][i]) || P[i][i] < 1e-12f) P[i][i] = 1e-12f;
+        if (P[i][i] > 10.0f) P[i][i] = 10.0f; 
+    }
     for (int i=0; i<7; i++) for (int j=i+1; j<7; j++) {
         float avg = 0.5f * (P[i][j] + P[j][i]); P[i][j] = P[j][i] = isnan(avg) ? 0.0f : avg;
     }
@@ -436,9 +443,10 @@ struct FlightCtrl {
                     target_esc2 = ESC_US_RUN;
                 } else { target_esc2 = ESC_US_OFF; }
 
+            // TƏHLÜKƏSİZLİK HƏLLİ: Slew Rate-in pozulmaması üçün taymer qorunur, yalnız motorlar müvəqqəti sönür
             } else {
                 target_esc1 = ESC_US_OFF; target_esc2 = ESC_US_OFF;
-                esc1_active_start_time = 0; 
+                // esc1_active_start_time = 0; <--- SİLİNDİ: Taymer sıfırlanmır ki, dron düzələndə 1 saniyə daha gözləməsin.
             }
         } else {
             target_esc1 = ESC_US_OFF; target_esc2 = ESC_US_OFF;
@@ -468,6 +476,7 @@ static uint8_t serial2_tx_buf[256], serial2_rx_buf[128];
 static uint32_t last_gps_rx_time = 0;
 static bool gps_is_swapped = false;
 static uint32_t last_gps_chars_processed = 0;
+static uint32_t system_boot_time = 0; // Boot vaxtı qeydiyyatı
 
 void gps_auto_swap_update() {
     if (tgps.charsProcessed() > last_gps_chars_processed) {
@@ -475,15 +484,18 @@ void gps_auto_swap_update() {
         last_gps_rx_time = millis(); 
     }
 
-    if (millis() - last_gps_rx_time > 4000) {
-        gps_is_swapped = !gps_is_swapped;
-        last_gps_rx_time = millis();
-        
-        #if defined(ARDUINO_TEENSY41)
-        if (gps_is_swapped) LPUART1_CTRL |= (1<<25); else LPUART1_CTRL &= ~(1<<25);
-        GPS_SERIAL.clear();
-        Serial.println(F("[GPS] XƏTA: Siqnal yoxdur! RX/TX Hard-Swap edildi (Teensy)."));
-        #endif
+    // TƏHLÜKƏSİZLİK HƏLLİ: Boot-dan sonra ilk 10 saniyə heç vaxt Swap etmə (GPS-in açılmasını gözlə)
+    if (millis() - system_boot_time > 10000) {
+        if (millis() - last_gps_rx_time > 4000) {
+            gps_is_swapped = !gps_is_swapped;
+            last_gps_rx_time = millis();
+            
+            #if defined(ARDUINO_TEENSY41)
+            if (gps_is_swapped) LPUART1_CTRL |= (1<<25); else LPUART1_CTRL &= ~(1<<25);
+            GPS_SERIAL.clear();
+            Serial.println(F("[GPS] XƏTA: Siqnal yoxdur! RX/TX Hard-Swap edildi (Teensy)."));
+            #endif
+        }
     }
 }
 
@@ -585,7 +597,7 @@ static void rf_send_binary_telemetry() {
     uint16_t gps_speed_cm_s = 0, gps_course_x100 = 0; 
     uint8_t gps_sats = 0;
     
-    if (ok.gps_fix) {
+    if (ok.gps_fix || (gps.lat != 0.0 && gps.lon != 0.0)) {
         lat_e7 = (int32_t)(gps.lat * 10000000.0); lon_e7 = (int32_t)(gps.lon * 10000000.0);
         gps_alt_cm = f_i32(gps.altitude, 100.0f); gps_speed_cm_s = f_u16(gps.speed, 100.0f);
         gps_course_x100 = f_u16(gps.course, 100.0f); gps_sats = gps.satellites;
@@ -607,6 +619,8 @@ static void rf_send_binary_telemetry() {
 
 // ======================== SETUP ========================
 void setup(){
+    system_boot_time = millis(); // Boot vaxtını yadda saxlayır
+    
     pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,HIGH);
     esc_init(); Serial.begin(115200); delay(200);
     
@@ -735,8 +749,8 @@ void loop(){
         lastGps = now;
         bool fresh = (tgps.location.age() < GPS_AGE_MAX_MS);
         if (tgps.location.isValid() && fresh) {
-            gps.lat = (float)tgps.location.lat();
-            gps.lon = (float)tgps.location.lng();
+            gps.lat = tgps.location.lat(); 
+            gps.lon = tgps.location.lng();
             gps.fix = 1;
         } else { gps.fix = 0; }
 
