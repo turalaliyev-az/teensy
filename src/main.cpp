@@ -56,6 +56,7 @@ static GPSData gps;
 #define ESC_US_OFF      1000
 #define ESC_US_RUN      1480
 
+// Saniyədə nə qədər PWM artsın?
 #define ESC_SLEW_RATE_US_PER_S 250.0f 
 
 void esc_init();
@@ -114,6 +115,10 @@ void rf_command_update() {
         if (c == '1') _armed = true;
         else if (c == '0') _armed = false;
     }
+}
+
+bool rf_armed() {
+    return _armed;
 }
 
 // ======================== BNO055 EEPROM ========================
@@ -449,9 +454,8 @@ struct FlightCtrl {
 // ======================== GLOBAL ========================
 static struct { uint8_t bno055:1, bme280:1, aht20:1, gps_fix:1; } ok;
 static AttitudeEKF ekf; static AltVel altvel; static FlightCtrl flight;
-// 'aht_t' və 'aht_h' telemetriyada istifadə olunmadığı üçün silindi və ya lazımdırsa telemetriya paketinə daxil edilə bilər.
-// Hal-hazırda təmizləmək üçün onlara ehtiyac yoxdur.
-static float ax,ay,az,gx,gy,gz,mx,my,mz, bme_t,bme_p,bme_h,bme_a; 
+
+static float ax,ay,az,gx,gy,gz,mx,my,mz, bme_t,bme_p,bme_h,bme_a, aht_t, aht_h; 
 static float mad_roll,mad_pitch,mad_yaw, fast_g = 1.0f;
 static bool fast_g_valid = false;
 
@@ -484,6 +488,23 @@ void gps_auto_swap_update() {
 }
 
 // ======================== RF PROTOKOL (Cüt CRC16) ========================
+#define RF_PKT_SYNC1        0xAA
+#define RF_PKT_SYNC2        0x55
+#define RF_PROTO_VERSION    0x01
+#define RF_DEVICE_ID        0xCC
+
+#define RF_PKT_TELEM        0x01
+#define RF_PKT_STATUS       0x02
+
+#define FLAG_BNO_OK         0x0001
+#define FLAG_BME_OK         0x0002
+#define FLAG_AHT_OK         0x0004
+#define FLAG_GPS_FIX        0x0008
+#define FLAG_ARMED          0x0010
+#define FLAG_MOTORS_ON      0x0020
+#define FLAG_CAL_SAVED      0x0040
+#define FLAG_IMPACT         0x0080
+
 static uint16_t rf_seq = 0;
 static uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
     uint16_t crc = 0xFFFF;
@@ -496,21 +517,92 @@ static uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
     }
     return crc;
 }
+
 static void put_u8(uint8_t* buf, size_t &idx, uint8_t v) { buf[idx++] = v; }
 static void put_u16(uint8_t* buf, size_t &idx, uint16_t v) { memcpy(buf + idx, &v, sizeof(v)); idx += sizeof(v); }
+static void put_i16(uint8_t* buf, size_t &idx, int16_t v) { memcpy(buf + idx, &v, sizeof(v)); idx += sizeof(v); }
 static void put_u32(uint8_t* buf, size_t &idx, uint32_t v) { memcpy(buf + idx, &v, sizeof(v)); idx += sizeof(v); }
+static void put_i32(uint8_t* buf, size_t &idx, int32_t v) { memcpy(buf + idx, &v, sizeof(v)); idx += sizeof(v); }
 
-// Lazım olmayan xəbərdarlıq funksiyaları kommentə alındı
-// static void put_i16(uint8_t* buf, size_t &idx, int16_t v) { memcpy(buf + idx, &v, sizeof(v)); idx += sizeof(v); }
-// static void put_i32(uint8_t* buf, size_t &idx, int32_t v) { memcpy(buf + idx, &v, sizeof(v)); idx += sizeof(v); }
+static int16_t f_i16(float v, float scale) {
+    if (isnan(v) || isinf(v)) return 0;
+    float x = v * scale;
+    return (int16_t)fmaxf(fminf(x, 32767.0f), -32768.0f);
+}
+
+static uint16_t f_u16(float v, float scale) {
+    if (isnan(v) || isinf(v) || v < 0.0f) return 0;
+    float x = v * scale;
+    return (uint16_t)fminf(x, 65535.0f);
+}
+
+static int32_t f_i32(float v, float scale) {
+    if (isnan(v) || isinf(v)) return 0;
+    double x = (double)v * (double)scale;
+    return (int32_t)fmax(fmin(x, 2147483647.0), -2147483648.0);
+}
 
 static void rf_write_packet(uint8_t type, const uint8_t* payload, uint8_t len) {
     uint8_t buf[128]; size_t i = 0; if (len > sizeof(buf) - 14) len = sizeof(buf) - 14;
-    put_u8(buf, i, 0xAA); put_u8(buf, i, 0x55); put_u8(buf, i, 0x01); put_u8(buf, i, 0xCC);
+    put_u8(buf, i, RF_PKT_SYNC1); put_u8(buf, i, RF_PKT_SYNC2); put_u8(buf, i, RF_PROTO_VERSION); put_u8(buf, i, RF_DEVICE_ID);
     put_u8(buf, i, type); put_u16(buf, i, rf_seq++); put_u32(buf, i, millis()); put_u8(buf, i, len);
     if (len > 0) { memcpy(buf + i, payload, len); i += len; }
     put_u16(buf, i, crc16_ccitt(buf, i));
     RF_SERIAL.write(buf, i);
+}
+
+static void rf_send_binary_telemetry() {
+    uint8_t p[96]; size_t i = 0;
+    uint16_t flags = 0;
+    
+    if (ok.bno055) flags |= FLAG_BNO_OK; 
+    if (ok.bme280) flags |= FLAG_BME_OK;
+    if (ok.aht20) flags |= FLAG_AHT_OK; 
+    if (ok.gps_fix) flags |= FLAG_GPS_FIX;
+    if (rf_armed()) flags |= FLAG_ARMED; 
+    if (flight.state_code() == FS_DESCENDING) flags |= FLAG_MOTORS_ON;
+    if (bno_cal_saved) flags |= FLAG_CAL_SAVED;
+    
+    put_u16(p, i, flags);
+
+    if (ok.bno055) {
+        put_i16(p, i, f_i16(ax, 100.0f)); put_i16(p, i, f_i16(ay, 100.0f)); put_i16(p, i, f_i16(az, 100.0f));
+        put_i16(p, i, f_i16(gx, 1000.0f)); put_i16(p, i, f_i16(gy, 1000.0f)); put_i16(p, i, f_i16(gz, 1000.0f));
+        put_i16(p, i, f_i16(mx, 10.0f)); put_i16(p, i, f_i16(my, 10.0f)); put_i16(p, i, f_i16(mz, 10.0f));
+    } else { for (uint8_t k = 0; k < 9; k++) put_i16(p, i, 0); }
+
+    if (ok.bme280) {
+        put_i16(p, i, f_i16(bme_t, 100.0f)); put_u16(p, i, f_u16(bme_p, 10.0f));
+        put_u16(p, i, f_u16(bme_h, 100.0f)); put_i32(p, i, f_i32(bme_a, 100.0f));
+    } else { put_i16(p, i, 0); put_u16(p, i, 0); put_u16(p, i, 0); put_i32(p, i, 0); }
+
+    if (ok.aht20 && !isnan(aht_t)) { 
+        put_i16(p, i, f_i16(aht_t, 100.0f)); 
+        put_u16(p, i, f_u16(aht_h, 100.0f)); 
+    } else { put_i16(p, i, 0); put_u16(p, i, 0); }
+
+    int32_t lat_e7 = 0, lon_e7 = 0, gps_alt_cm = 0; 
+    uint16_t gps_speed_cm_s = 0, gps_course_x100 = 0; 
+    uint8_t gps_sats = 0;
+    
+    if (ok.gps_fix) {
+        lat_e7 = (int32_t)(gps.lat * 10000000.0); lon_e7 = (int32_t)(gps.lon * 10000000.0);
+        gps_alt_cm = f_i32(gps.altitude, 100.0f); gps_speed_cm_s = f_u16(gps.speed, 100.0f);
+        gps_course_x100 = f_u16(gps.course, 100.0f); gps_sats = gps.satellites;
+    }
+    
+    put_i32(p, i, lat_e7); put_i32(p, i, lon_e7); put_i32(p, i, gps_alt_cm);
+    put_u16(p, i, gps_speed_cm_s); put_u16(p, i, gps_course_x100); put_u8(p, i, gps_sats);
+
+    put_i16(p, i, f_i16(mad_roll, 100.0f)); put_i16(p, i, f_i16(mad_pitch, 100.0f)); put_i16(p, i, f_i16(mad_yaw, 100.0f));
+    put_i32(p, i, f_i32(altvel.rel_alt, 100.0f)); put_i16(p, i, f_i16(altvel.vel, 100.0f));
+    put_u16(p, i, f_u16(altvel.g_force, 1000.0f)); put_i16(p, i, f_i16(altvel.dpdt, 1000.0f));
+
+    put_u8(p, i, rf_armed() ? 1 : 0); 
+    put_u8(p, i, flight.state_code()); 
+    put_u16(p, i, (uint16_t)_current_esc1_us);
+
+    rf_write_packet(RF_PKT_TELEM, p, i);
 }
 
 // ======================== SETUP ========================
@@ -571,7 +663,7 @@ void loop(){
         
         if (old_state != flight.state_code()) {
             uint8_t p[2] = {(uint8_t)(_armed?1:0), flight.state_code()};
-            rf_write_packet(0x02, p, 2);
+            rf_write_packet(RF_PKT_STATUS, p, 2);
         }
     }
 
@@ -629,6 +721,32 @@ void loop(){
         }
     }
 
+    // --- Temp / AHT20 (1 Hz) ---
+    if (ok.aht20 && now - lastAht >= AHT20_PERIOD) {
+        lastAht = now;
+        sensors_event_t humidity, temp;
+        aht.getEvent(&humidity, &temp);
+        aht_t = temp.temperature;
+        aht_h = humidity.relative_humidity;
+    }
+
+    // --- GPS Parsing State (5 Hz) ---
+    if (now - lastGps >= GPS_PERIOD) {
+        lastGps = now;
+        bool fresh = (tgps.location.age() < GPS_AGE_MAX_MS);
+        if (tgps.location.isValid() && fresh) {
+            gps.lat = (float)tgps.location.lat();
+            gps.lon = (float)tgps.location.lng();
+            gps.fix = 1;
+        } else { gps.fix = 0; }
+
+        if (tgps.altitude.isValid()) gps.altitude = (float)tgps.altitude.meters();
+        if (tgps.speed.isValid()) gps.speed = (float)tgps.speed.mps();
+        if (tgps.course.isValid()) gps.course = (float)tgps.course.deg();
+        gps.satellites = (uint8_t)tgps.satellites.value();
+        ok.gps_fix = (gps.fix > 0);
+    }
+
     // --- BNO Kalibrasiya EEPROM yazımı (1 Hz) ---
     if (ok.bno055 && now - last_cal_check_ms >= 1000) {
         last_cal_check_ms = now;
@@ -647,5 +765,11 @@ void loop(){
         Serial.print(F("m Vz:")); Serial.print(altvel.vel, 1);
         Serial.print(F("m/s | E1:")); Serial.print(_current_esc1_us, 0); 
         Serial.print(F(" E2:")); Serial.print(_current_esc2_us, 0); Serial.println(F("us"));
+    }
+
+    // --- RF Binary Telemetry (15 Hz) ---
+    if (now - lastRf >= RF_PERIOD) {
+        lastRf = now;
+        rf_send_binary_telemetry();
     }
 }
