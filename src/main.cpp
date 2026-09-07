@@ -40,6 +40,13 @@ static uint32_t us_to_duty(uint16_t us) {
     return (uint32_t)us * 65536UL / 20000UL;
 }
 
+
+
+
+// İleri bildirimler: esc_init() bunları tanımdan önce kullanır
+void esc_write_us(uint16_t us1, uint16_t us2);
+void esc_write_us(uint16_t us);
+
 void esc_init() {
     pinMode(ESC1_PIN, OUTPUT);
     pinMode(ESC2_PIN, OUTPUT);
