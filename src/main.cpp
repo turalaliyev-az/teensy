@@ -56,10 +56,10 @@ static GPSData gps;
 #define ESC_US_MIN      1000
 #define ESC_US_MAX      2000
 #define ESC_US_OFF      1000
-#define ESC_US_RUN      1480
+#define ESC_US_RUN      1650
 
 // Saniyədə nə qədər PWM artsın/azalsın?
-#define ESC_SLEW_RATE_US_PER_S 250.0f
+#define ESC_SLEW_RATE_US_PER_S 1500.0f
 
 void esc_init();
 void esc_write_us(float us1, float us2);
@@ -236,16 +236,16 @@ void AltVel::update(float pressure_hpa, float accel_norm_ms2, float a_world_z_ms
 
     float g_raw = imu_ok ? fmaxf((accel_norm_ms2 / GRAVITY), 0.0f) : 1.0f;
     _g_smooth += 0.15f * (g_raw - _g_smooth); g_force = _g_smooth;
-    _p_smooth += 0.30f * (pressure_hpa - _p_smooth);
-    _dpdt_smooth += 0.25f * (((_p_smooth - _prev_p) / dt) - _dpdt_smooth);
+    _p_smooth += 0.60f * (pressure_hpa - _p_smooth);
+    _dpdt_smooth += 0.50f * (((_p_smooth - _prev_p) / dt) - _dpdt_smooth);
     _prev_p = _p_smooth; dpdt = _dpdt_smooth;
 
     float z = 44330.0f * (1.0f - powf(_p_smooth / _p0, 0.1903f));
     float a_vert = imu_ok ? fmaxf(fminf((a_world_z_ms2 - GRAVITY), 50.0f), -50.0f) : 0.0f;
-    _a_smooth += 0.25f * (a_vert - _a_smooth);
+    _a_smooth += 0.50f * (a_vert - _a_smooth);
 
     float dyn_factor = fminf(1.0f + 4.0f * fabsf(g_raw - 1.0f), 10.0f);
-    float r_alt = 1.0f * dyn_factor; float q_alt = 0.05f * dyn_factor; float q_vel = 0.6f * dyn_factor;
+    float r_alt = 0.3f * dyn_factor; float q_alt = 0.05f * dyn_factor; float q_vel = 0.6f * dyn_factor;
 
     float alt_p = rel_alt + vel * dt + 0.5f * _a_smooth * dt * dt;
     float vel_p = vel + _a_smooth * dt;
@@ -467,8 +467,8 @@ struct FlightCtrl {
             esc_update_target(target_esc1, target_esc2, dt); return;
         }
 
-        if (tilt > 15.0f) tilt_hysteresis_ok = false;
-        else if (tilt < 10.0f) tilt_hysteresis_ok = true;
+        if (tilt > 60.0f) tilt_hysteresis_ok = false;
+        else if (tilt < 45.0f) tilt_hysteresis_ok = true;
 
         if (state == FS_STANDBY) {
             if (rel_alt > 0.3f || vel > 0.3f) { state = FS_LAUNCHED; max_alt = rel_alt; }
@@ -481,7 +481,7 @@ struct FlightCtrl {
             if (rel_alt <= 0.1f) state = FS_LANDED;
             if (fabsf(vel) < 0.3f) {
                 if (landing_steady_start == 0) landing_steady_start = now;
-                else if (now - landing_steady_start > 500UL) state = FS_LANDED;
+                else if (now - landing_steady_start > 2000UL) state = FS_LANDED;
             } else { landing_steady_start = 0; }
         }
 
