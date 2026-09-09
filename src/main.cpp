@@ -478,10 +478,19 @@ struct FlightCtrl {
             if (vel < -0.2f || (max_alt - rel_alt > 0.2f)) state = FS_DESCENDING;
         }
         else if (state == FS_DESCENDING) {
-            if (rel_alt <= 0.1f) state = FS_LANDED;
-            if (fabsf(vel) < 0.3f) {
+            if (rel_alt <= 0.1f) { state = FS_LANDED; landing_steady_start = 0; }
+            else if (fabsf(vel) < 0.3f) {
                 if (landing_steady_start == 0) landing_steady_start = now;
-                else if (now - landing_steady_start > 2000UL) state = FS_LANDED;
+                else if (now - landing_steady_start > 2000UL) { state = FS_LANDED; landing_steady_start = 0; }
+            } else { landing_steady_start = 0; }
+        }
+        else if (state == FS_LANDED) {
+            // Yerde sabit duruyorsa 2 sn sonra yeniden test için STANDBY'ye dön (tekrarlanabilir)
+            if (rel_alt < 0.3f && fabsf(vel) < 0.3f) {
+                if (landing_steady_start == 0) landing_steady_start = now;
+                else if (now - landing_steady_start > 2000UL) {
+                    state = FS_STANDBY; max_alt = 0.0f; landing_steady_start = 0;
+                }
             } else { landing_steady_start = 0; }
         }
 
