@@ -50,11 +50,11 @@ static GPSData gps;
 #define GRAVITY         9.80665f
 
 // ======================== ESC & SLEW RATE CONTROLLER ========================
-#define ESC1_PIN        15
-#define ESC2_PIN        23
+#define ESC1_PIN        2
+#define ESC2_PIN        3
 #define ESC_PWM_FREQ    50.0f
 #define ESC_US_MIN      1000
-#define ESC_US_MAX      2000
+#define ESC_US_MAX      1500
 #define ESC_US_OFF      1000
 #define ESC_US_RUN      1480
 
