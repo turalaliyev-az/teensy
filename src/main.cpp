@@ -54,10 +54,12 @@ static GPSData gps;
 #define ESC2_PIN        3
 #define ESC_PWM_FREQ    50.0f
 #define ESC_US_MIN      1000
-#define ESC_US_MAX      1500
+#define ESC_US_MAX      2000
 #define ESC_US_OFF      1000
 #define ESC_US_RUN      1480
-
+#define ESC_TEST_MODE   false
+#define ESC_CALIBRATE_MODE false
+#define ESC_CALIBRATE_US 2000
 // Saniyədə nə qədər PWM artsın/azalsın?
 #define ESC_SLEW_RATE_US_PER_S 250.0f 
 
@@ -622,7 +624,25 @@ void setup(){
     system_boot_time = millis(); // Boot vaxtını yadda saxlayır
     
     pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,HIGH);
-    esc_init(); Serial.begin(115200); delay(200);
+    esc_init(); Serial.begin(115200); delay(2000);
+
+    if(ESC_CALIBRATE_US) { 
+       Serial.println(F("\n!!! ESC KALİBRASİYA REJİMİ AKTİVDİR !!!"));
+        Serial.println(F("Batareyanı İNDİ QOŞUN! ESC-lərə Max Throttle (2000us) göndərilir..."));
+        esc_write_us(2000, 2000);
+        
+        // Batareyanı qoşub Biip səslərini eşitmək üçün 6 saniyə vaxt verir
+        delay(6000); 
+        
+        Serial.println(F("Min Throttle (1000us) göndərilir. ARM səsi gözləyin..."));
+        esc_write_us(1000, 1000);
+        delay(4000);
+        
+        Serial.println(F("KALİBRASİYA BİTDİ! Lütfən kodda CALIBRATE_ESC-i 0 edib Teensy-ə yenidən yükləyin."));
+        while(1); // Proqramı burada kilidlə (uçuşa keçməsin)
+    
+    
+    }
     
     Serial.println(F("\n=== TEENSY 4.1 " DEVICE_NAME " ==="));
     Serial.println(F("[MOTOR MƏNTİQİ] Düşüş zamanı ESC1 xətti artır -> 1 saniyə sonra ESC2 artır"));
