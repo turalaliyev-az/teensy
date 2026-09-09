@@ -65,7 +65,7 @@ void esc_init();
 void esc_write_us(float us1, float us2);
 static float _current_esc1_us = ESC_US_OFF;
 static float _current_esc2_us = ESC_US_OFF;
-static bool _armed = false;
+static bool _armed = true;
 
 static uint32_t us_to_duty(float us) {
     us = fmaxf(fminf(us, ESC_US_MAX), ESC_US_MIN);
