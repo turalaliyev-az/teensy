@@ -658,9 +658,45 @@ static void rf_send_binary_telemetry() {
 
     put_u8(p, i, rf_armed() ? 1 : 0);
     put_u8(p, i, flight.state_code());
-    put_u16(p, i, (uint16_t)_current_esc1_us);
+    put_u16(p, i, (uint16_t)_current_esc1_us); put_u16(p, i, (uint16_t)_current_esc2_us);
 
     rf_write_packet(RF_PKT_TELEM, p, i);
+}
+
+// ======================== LED DURUM GÖSTERGESİ (USB'siz test) ========================
+//   FS_STANDBY(0)    = 1 yanıp sönme
+//   FS_LAUNCHED(1)   = 2 yanıp sönme
+//   FS_DESCENDING(2) = LED SÜREKLİ YANIK (motor aktif)
+//   FS_LANDED(3)     = 4 yanıp sönme
+static uint32_t led_prev_ms = 0;
+static uint8_t  led_idx = 0;
+static uint8_t  led_cur_state = 0xFF;
+
+static void led_show_state(uint8_t st) {
+    const uint16_t ON_MS = 180, OFF_MS = 180, GAP_MS = 1100;
+    uint32_t now = millis();
+
+    if (st == FS_DESCENDING) {              // motor aktif -> LED sürekli yanık
+        if (led_cur_state != st) { led_cur_state = st; led_idx = 0; led_prev_ms = now; }
+        digitalWrite(LED_PIN, HIGH);
+        return;
+    }
+
+    if (led_cur_state != st) {              // durum değişti -> döngüyü sıfırla
+        led_cur_state = st; led_idx = 0; led_prev_ms = now;
+        digitalWrite(LED_PIN, LOW);
+        return;
+    }
+
+    uint8_t n = st + 1;                     // 1..4 yanıp sönme
+    if (led_idx < 2 * n) {
+        bool on = (led_idx % 2 == 0);
+        digitalWrite(LED_PIN, on ? HIGH : LOW);
+        if (now - led_prev_ms >= (on ? ON_MS : OFF_MS)) { led_prev_ms = now; led_idx++; }
+    } else {
+        digitalWrite(LED_PIN, LOW);
+        if (now - led_prev_ms >= GAP_MS) { led_idx = 0; led_prev_ms = now; }
+    }
 }
 
 // ======================== SETUP ========================
@@ -706,6 +742,7 @@ void setup(){
 void loop(){
     uint32_t now=millis();
     rf_command_update();
+    led_show_state(flight.state_code());
 
     uint8_t reads = 0;
     while (GPS_SERIAL.available() > 0 && reads++ < MAX_UART_READS) {
