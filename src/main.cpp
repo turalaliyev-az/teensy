@@ -56,7 +56,7 @@ static GPSData gps;
 #define ESC_US_MIN      1000
 #define ESC_US_MAX      2000
 #define ESC_US_OFF      1000
-#define ESC_US_RUN      1650
+#define ESC_US_RUN      1480
 
 // Saniyədə nə qədər PWM artsın/azalsın?
 #define ESC_SLEW_RATE_US_PER_S 1500.0f
@@ -471,26 +471,17 @@ struct FlightCtrl {
         else if (tilt < 45.0f) tilt_hysteresis_ok = true;
 
         if (state == FS_STANDBY) {
-            if (rel_alt > 0.3f || vel > 0.3f) { state = FS_LAUNCHED; max_alt = rel_alt; }
+            if (rel_alt > 5.0f && vel > 2.0f) { state = FS_LAUNCHED; max_alt = rel_alt; }
         }
         else if (state == FS_LAUNCHED) {
             if (rel_alt > max_alt) max_alt = rel_alt;
-            if (vel < -0.2f || (max_alt - rel_alt > 0.2f)) state = FS_DESCENDING;
+            if (vel < -1.0f && (max_alt - rel_alt > 2.0f)) state = FS_DESCENDING;
         }
         else if (state == FS_DESCENDING) {
-            if (rel_alt <= 0.1f) { state = FS_LANDED; landing_steady_start = 0; }
+            if (rel_alt <= 1.0f) { state = FS_LANDED; landing_steady_start = 0; }
             else if (fabsf(vel) < 0.3f) {
                 if (landing_steady_start == 0) landing_steady_start = now;
                 else if (now - landing_steady_start > 2000UL) { state = FS_LANDED; landing_steady_start = 0; }
-            } else { landing_steady_start = 0; }
-        }
-        else if (state == FS_LANDED) {
-            // Yerde sabit duruyorsa 2 sn sonra yeniden test için STANDBY'ye dön (tekrarlanabilir)
-            if (rel_alt < 0.3f && fabsf(vel) < 0.3f) {
-                if (landing_steady_start == 0) landing_steady_start = now;
-                else if (now - landing_steady_start > 2000UL) {
-                    state = FS_STANDBY; max_alt = 0.0f; landing_steady_start = 0;
-                }
             } else { landing_steady_start = 0; }
         }
 
