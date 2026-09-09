@@ -471,11 +471,11 @@ struct FlightCtrl {
         else if (tilt < 10.0f) tilt_hysteresis_ok = true;
 
         if (state == FS_STANDBY) {
-            if (rel_alt > 0.3f && vel > 0.3f) { state = FS_LAUNCHED; max_alt = rel_alt; }
+            if (rel_alt > 0.3f || vel > 0.3f) { state = FS_LAUNCHED; max_alt = rel_alt; }
         }
         else if (state == FS_LAUNCHED) {
             if (rel_alt > max_alt) max_alt = rel_alt;
-            if (vel < -0.2f && (max_alt - rel_alt > 0.2f)) state = FS_DESCENDING;
+            if (vel < -0.2f || (max_alt - rel_alt > 0.2f)) state = FS_DESCENDING;
         }
         else if (state == FS_DESCENDING) {
             if (rel_alt <= 0.1f) state = FS_LANDED;
