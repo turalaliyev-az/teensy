@@ -19,15 +19,15 @@ static TinyGPSPlus tgps;
 // ======================== GPS OBYEKTI ========================
 struct GPSData {
     // SƏNAYE STANDARTI: Koordinatlar dəqiqlik itməməsi üçün mütləq double olmalıdır!
-    double lat, lon; 
-    float altitude, speed, course;
-    uint8_t fix, satellites;
-    GPSData() : lat(0.0),lon(0.0),altitude(0.0f),speed(0.0f),course(0.0f),fix(0),satellites(0) {}
+    double lat, lon;
+    float altitude, speed, course, hdop;
+    uint8_t fix, satellites, fix_quality;
+    GPSData() : lat(0.0),lon(0.0),altitude(0.0f),speed(0.0f),course(0.0f),hdop(0.0f),fix(0),satellites(0),fix_quality(0) {}
 };
 static GPSData gps;
 
 // ======================== UMUMI SABITLER ========================
-#define DEVICE_HEADER F("CC")
+
 #define DEVICE_NAME   "DRONE (CC) - INDUSTRIAL PRO"
 #define LED_PIN         13
 #define RF_SERIAL       Serial2
@@ -39,39 +39,37 @@ static GPSData gps;
 #define MAX_UART_READS  64
 
 #define I2C_FREQ        400000UL
-#define BNO055_PERIOD   10   
-#define BME280_PERIOD   40   
-#define AHT20_PERIOD    1000 
-#define GPS_PERIOD      200  
+#define BNO055_PERIOD   10
+#define BME280_PERIOD   40
+#define AHT20_PERIOD    1000
+#define GPS_PERIOD      200
 #define PRINT_PERIOD    200
-#define RF_PERIOD       66   
-#define FLIGHT_PERIOD   10   
+#define RF_PERIOD       66
+#define FLIGHT_PERIOD   10
 #define SEA_LEVEL_HPA   1013.25f
 #define GRAVITY         9.80665f
 
 // ======================== ESC & SLEW RATE CONTROLLER ========================
-#define ESC1_PIN        2
-#define ESC2_PIN        3
+#define ESC1_PIN        15
+#define ESC2_PIN        23
 #define ESC_PWM_FREQ    50.0f
 #define ESC_US_MIN      1000
 #define ESC_US_MAX      2000
 #define ESC_US_OFF      1000
 #define ESC_US_RUN      1480
-#define ESC_TEST_MODE   false
-#define ESC_CALIBRATE_MODE false
-#define ESC_CALIBRATE_US 2000
+
 // Saniyədə nə qədər PWM artsın/azalsın?
-#define ESC_SLEW_RATE_US_PER_S 250.0f 
+#define ESC_SLEW_RATE_US_PER_S 250.0f
 
 void esc_init();
 void esc_write_us(float us1, float us2);
 static float _current_esc1_us = ESC_US_OFF;
 static float _current_esc2_us = ESC_US_OFF;
-static bool _armed = true;
+static bool _armed = false;
 
 static uint32_t us_to_duty(float us) {
     us = fmaxf(fminf(us, ESC_US_MAX), ESC_US_MIN);
-    return (uint32_t)us * 65536UL / 20000UL;
+    return ((uint32_t)(us + 0.5f)) * 65536UL / 20000UL;
 }
 
 void esc_init() {
@@ -89,7 +87,7 @@ void esc_update_target(float target_us1, float target_us2, float dt) {
         _current_esc2_us = ESC_US_OFF;
     } else {
         float step = ESC_SLEW_RATE_US_PER_S * dt;
-        
+
         if (target_us1 > _current_esc1_us) {
             _current_esc1_us = fminf(_current_esc1_us + step, target_us1);
         } else {
@@ -117,12 +115,38 @@ void esc_write_us(float us1, float us2) {
 }
 
 // ======================== RF EMRLERI ========================
+#define RF_PROTO_VERSION  0x01
+#define RF_DEVICE_ID      0xCC
+#define RF_CMD_SYNC1      0xAA
+#define RF_CMD_SYNC2      0x55
+#define RF_CMD_ARM        0x01
+#define RF_CMD_DISARM     0x00
+
+static uint16_t crc16_ccitt(const uint8_t* data, size_t len);  // aşağıda tanımlı (forward decl)
+
+static uint8_t rf_cmd_state = 0, rf_cmd_buf[5], rf_cmd_idx = 0;
+
 void rf_command_update() {
     uint8_t reads = 0;
     while (Serial2.available() && reads++ < MAX_UART_READS) {
-        char c = (char)Serial2.read();
-        if (c == '1') _armed = true;
-        else if (c == '0') _armed = false;
+        uint8_t c = (uint8_t)Serial2.read();
+        switch (rf_cmd_state) {
+            case 0: if (c == RF_CMD_SYNC1) rf_cmd_state = 1; break;
+            case 1: rf_cmd_state = (c == RF_CMD_SYNC2) ? 2 : (c == RF_CMD_SYNC1 ? 1 : 0); break;
+            case 2:
+                rf_cmd_buf[rf_cmd_idx++] = c;
+                if (rf_cmd_idx >= 5) {
+                    rf_cmd_idx = 0;
+                    uint16_t crc = crc16_ccitt(rf_cmd_buf, 3);
+                    uint16_t rxcrc = (uint16_t)(rf_cmd_buf[3] | ((uint16_t)rf_cmd_buf[4] << 8));
+                    if (rf_cmd_buf[0] == RF_PROTO_VERSION && rf_cmd_buf[1] == RF_DEVICE_ID && crc == rxcrc) {
+                        if      (rf_cmd_buf[2] == RF_CMD_ARM)    _armed = true;
+                        else if (rf_cmd_buf[2] == RF_CMD_DISARM) _armed = false;
+                    }
+                    rf_cmd_state = 0;
+                }
+                break;
+        }
     }
 }
 bool rf_armed() { return _armed; }
@@ -148,7 +172,7 @@ static bool bno_load_calibration() {
     adafruit_bno055_offsets_t offsets;
     EEPROM.get(BNO_CAL_EEPROM_ADDR + 4, offsets);
     uint8_t buf[sizeof(offsets)]; memcpy(buf, &offsets, sizeof(offsets));
-    
+
     if (checksum8(buf, sizeof(buf)) != stored_cs) return false;
     bno.setSensorOffsets(offsets);
     return true;
@@ -171,6 +195,7 @@ struct AltVel {
     float rel_alt, vel, g_force, dpdt;
     void init();
     void update(float pressure_hpa, float accel_norm_ms2, float a_world_z_ms2, bool imu_ok);
+    void updateFromGPS(float alt_m, uint32_t now_ms);
     bool calibrated() const { return _calibrated; }
 private:
     float _p0, _p_smooth, _prev_p, _dpdt_smooth, _a_smooth, _g_smooth;
@@ -178,6 +203,9 @@ private:
     float _P00, _P01, _P11, _calib_sum;
     uint32_t _calib_start_ms, _calib_count;
     bool _calibrated;
+    float _gps_base, _gps_prev_alt, _gps_prev_rel;
+    bool _gps_base_set;
+    uint32_t _gps_prev_ms;
 };
 
 void AltVel::init() {
@@ -185,6 +213,8 @@ void AltVel::init() {
     _p0 = 1013.25f; _p_smooth = _prev_p = _dpdt_smooth = _a_smooth = _g_smooth = 0.0f;
     _last_us = 0; _P00 = _P11 = 1.0f; _P01 = 0.0f;
     _calib_start_ms = _calib_sum = _calib_count = 0; _calibrated = false;
+    _gps_base = _gps_prev_alt = _gps_prev_rel = 0.0f;
+    _gps_base_set = false; _gps_prev_ms = 0;
 }
 
 void AltVel::update(float pressure_hpa, float accel_norm_ms2, float a_world_z_ms2, bool imu_ok) {
@@ -228,6 +258,25 @@ void AltVel::update(float pressure_hpa, float accel_norm_ms2, float a_world_z_ms
     _P00 = (1.0f - K0) * P00_p; _P01 = (1.0f - K0) * P01_p; _P11 = P11_p - K1 * P01_p;
 }
 
+// GPS irtifa fallback (BME280 yoksa) — ağır filtrelenmiş
+void AltVel::updateFromGPS(float alt_m, uint32_t now_ms) {
+    if (isnan(alt_m) || isinf(alt_m)) return;
+    if (!_gps_base_set) {
+        _gps_base = alt_m; _gps_base_set = true;
+        _gps_prev_alt = alt_m; _gps_prev_ms = now_ms;
+        rel_alt = 0.0f; vel = 0.0f; return;
+    }
+    float dt = (now_ms >= _gps_prev_ms) ? (float)(now_ms - _gps_prev_ms) * 1.0e-3f : 0.2f;
+    if (dt < 0.05f) dt = 0.05f;
+    if (dt > 1.0f)  dt = 1.0f;
+    float raw_rel = alt_m - _gps_base;
+    float new_rel = rel_alt + 0.15f * (raw_rel - rel_alt);
+    float raw_vel = (new_rel - _gps_prev_rel) / dt;
+    vel = 0.3f * vel + 0.7f * raw_vel;
+    rel_alt = new_rel;
+    _gps_prev_rel = new_rel; _gps_prev_alt = alt_m; _gps_prev_ms = now_ms;
+}
+
 // ======================== QUATERNION ROTATION & EKF ========================
 static void quat_rotate_vec(const float q[4], const float v[3], float out[3]) {
     float qw = q[0], qx = q[1], qy = q[2], qz = q[3];
@@ -262,12 +311,12 @@ void AttitudeEKF::init(float ax, float ay, float az) {
     float n = sqrtf(ax*ax + ay*ay + az*az); if (n < 1e-4f) n = 1.0f;
     ax /= n; ay /= n; az /= n;
     float d = az;
-    if (d > 0.999999f) { q[0]=1.0f; q[1]=q[2]=q[3]=0.0f; } 
-    else if (d < -0.999999f) { q[0]=0.0f; q[1]=1.0f; q[2]=q[3]=0.0f; } 
+    if (d > 0.999999f) { q[0]=1.0f; q[1]=q[2]=q[3]=0.0f; }
+    else if (d < -0.999999f) { q[0]=0.0f; q[1]=1.0f; q[2]=q[3]=0.0f; }
     else {
         float ang = acosf(d); float s = sinf(ang * 0.5f);
         float an = sqrtf(ay*ay + ax*ax);
-        if (an < 1e-8f) an = 1e-8f; 
+        if (an < 1e-8f) an = 1e-8f;
         q[0] = cosf(ang * 0.5f); q[1] = s * ay / an; q[2] = s * -ax / an; q[3] = 0.0f;
     }
     b[0] = b[1] = b[2] = 0.0f; memset(P, 0, sizeof(P));
@@ -320,16 +369,16 @@ void AttitudeEKF::updateMag(float mx, float my, float mz) {
     if (fabsf(mmag - _mag_norm_ref) / _mag_norm_ref > 0.45f) return;
 
     float meas[3] = {mx / mmag, my / mmag, mz / mmag}, m_world[3]; quat_rotate_vec(q, meas, m_world);
-    
+
     float norm_ref = sqrtf(m_world[0]*m_world[0] + m_world[1]*m_world[1]);
     if (norm_ref < 0.2f) return;
 
     float ref_raw[3] = {m_world[0] / norm_ref, m_world[1] / norm_ref, 0.0f};
-    
-    if (!_mag_ref_valid) { memcpy(_mag_ref, ref_raw, sizeof(_mag_ref)); _mag_ref_valid = true; } 
+
+    if (!_mag_ref_valid) { memcpy(_mag_ref, ref_raw, sizeof(_mag_ref)); _mag_ref_valid = true; }
     else {
-        _mag_ref[0] += 0.05f * (ref_raw[0] - _mag_ref[0]); 
-        _mag_ref[1] += 0.05f * (ref_raw[1] - _mag_ref[1]); 
+        _mag_ref[0] += 0.05f * (ref_raw[0] - _mag_ref[0]);
+        _mag_ref[1] += 0.05f * (ref_raw[1] - _mag_ref[1]);
         float rn = sqrtf(_mag_ref[0]*_mag_ref[0] + _mag_ref[1]*_mag_ref[1]);
         if (rn >= 0.2f) { _mag_ref[0] /= rn; _mag_ref[1] /= rn; _mag_ref[2] = 0.0f; }
     }
@@ -339,7 +388,7 @@ void AttitudeEKF::updateMag(float mx, float my, float mz) {
 void AttitudeEKF::symmetrize() {
     for (int i=0; i<7; i++) {
         if (isnan(P[i][i]) || isinf(P[i][i]) || P[i][i] < 1e-12f) P[i][i] = 1e-12f;
-        if (P[i][i] > 10.0f) P[i][i] = 10.0f; 
+        if (P[i][i] > 10.0f) P[i][i] = 10.0f;
     }
     for (int i=0; i<7; i++) for (int j=i+1; j<7; j++) {
         float avg = 0.5f * (P[i][j] + P[j][i]); P[i][j] = P[j][i] = isnan(avg) ? 0.0f : avg;
@@ -350,7 +399,7 @@ void AttitudeEKF::updateVectorMeasurement(const float meas[3], const float ref[3
     if (r <= 1e-9f) return;
     float h[3]; quat_rotate_vec_inv(q, ref, h);
     float inn0 = meas[0] - h[0], inn1 = meas[1] - h[1], inn2 = meas[2] - h[2];
-    
+
     float H[3][7] = {0}, w = q[0], x = q[1], yy = q[2], zz = q[3], rx = ref[0], ry = ref[1], rz = ref[2];
     H[0][0] = 2.0f*w*rx  + 2.0f*zz*ry - 2.0f*yy*rz; H[0][1] = 2.0f*x*rx  + 2.0f*yy*ry + 2.0f*zz*rz; H[0][2] = -2.0f*yy*rx + 2.0f*x*ry - 2.0f*w*rz; H[0][3] = -2.0f*zz*rx + 2.0f*w*ry + 2.0f*x*rz;
     H[1][0] = -2.0f*zz*rx + 2.0f*w*ry + 2.0f*x*rz; H[1][1] = 2.0f*yy*rx  - 2.0f*x*ry + 2.0f*w*rz; H[1][2] = 2.0f*x*rx   + 2.0f*yy*ry + 2.0f*zz*rz; H[1][3] = -2.0f*w*rx  - 2.0f*zz*ry + 2.0f*yy*rz;
@@ -390,25 +439,25 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 }
 
 // ======================== UCUS NEZARETCISI (STATE MACHINE) ========================
-enum FlightState : uint8_t { 
-    FS_STANDBY = 0,       
-    FS_LAUNCHED = 1,      
-    FS_DESCENDING = 2,    
-    FS_LANDED = 3         
+enum FlightState : uint8_t {
+    FS_STANDBY = 0,
+    FS_LAUNCHED = 1,
+    FS_DESCENDING = 2,
+    FS_LANDED = 3
 };
 
 struct FlightCtrl {
     FlightState state;
     float max_alt, target_esc1, target_esc2;
     bool tilt_hysteresis_ok;
-    
-    uint32_t esc1_active_start_time; 
-    uint32_t landing_steady_start;   
+
+    uint32_t esc1_active_start_time;
+    uint32_t landing_steady_start;
 
     void init() {
-        state = FS_STANDBY; max_alt = 0.0f; 
+        state = FS_STANDBY; max_alt = 0.0f;
         target_esc1 = target_esc2 = ESC_US_OFF;
-        tilt_hysteresis_ok = true; 
+        tilt_hysteresis_ok = true;
         esc1_active_start_time = landing_steady_start = 0;
     }
 
@@ -422,15 +471,15 @@ struct FlightCtrl {
         else if (tilt < 10.0f) tilt_hysteresis_ok = true;
 
         if (state == FS_STANDBY) {
-            if (rel_alt > 0.2f && vel > 0.2f) { state = FS_LAUNCHED; max_alt = rel_alt; }
-        } 
+            if (rel_alt > 0.3f && vel > 0.3f) { state = FS_LAUNCHED; max_alt = rel_alt; }
+        }
         else if (state == FS_LAUNCHED) {
             if (rel_alt > max_alt) max_alt = rel_alt;
-            if (vel < -0.2f && (max_alt - rel_alt > 0.1f)) state = FS_DESCENDING;
-        } 
+            if (vel < -0.2f && (max_alt - rel_alt > 0.2f)) state = FS_DESCENDING;
+        }
         else if (state == FS_DESCENDING) {
             if (rel_alt <= 0.1f) state = FS_LANDED;
-            if (fabsf(vel) < 0.3f) { 
+            if (fabsf(vel) < 0.3f) {
                 if (landing_steady_start == 0) landing_steady_start = now;
                 else if (now - landing_steady_start > 500UL) state = FS_LANDED;
             } else { landing_steady_start = 0; }
@@ -465,47 +514,40 @@ struct FlightCtrl {
 static struct { uint8_t bno055:1, bme280:1, aht20:1, gps_fix:1; } ok;
 static AttitudeEKF ekf; static AltVel altvel; static FlightCtrl flight;
 
-static float ax,ay,az,gx,gy,gz,mx,my,mz, bme_t,bme_p,bme_h,bme_a, aht_t, aht_h; 
+static float ax,ay,az,gx,gy,gz,mx,my,mz, bme_t,bme_p,bme_h,bme_a, aht_t, aht_h;
 static float mad_roll,mad_pitch,mad_yaw, fast_g = 1.0f;
 static bool fast_g_valid = false;
+static bool gps_alt_valid = false;
 
-static uint32_t lastBno, lastBme, lastAht, lastGps, lastPrn, lastRf, lastGpsDbg, lastMag, lastFlight;
+static uint32_t lastBno, lastBme, lastAht, lastGps, lastPrn, lastRf, lastMag, lastFlight;
 static uint32_t last_imu_us = 0, last_cal_check_ms = 0, cal_good_start_ms = 0;
 
 static uint8_t serial2_tx_buf[256], serial2_rx_buf[128];
+static uint8_t serial6_tx_buf[64], serial6_rx_buf[256];
 
-// ======================== GPS AUTO-SWAP ========================
+// ======================== GPS KAYBI TESPİTİ ========================
 static uint32_t last_gps_rx_time = 0;
-static bool gps_is_swapped = false;
-static uint32_t last_gps_chars_processed = 0;
+static uint32_t last_gps_checksum = 0;
 static uint32_t system_boot_time = 0; // Boot vaxtı qeydiyyatı
 
 void gps_auto_swap_update() {
-    if (tgps.charsProcessed() > last_gps_chars_processed) {
-        last_gps_chars_processed = tgps.charsProcessed();
-        last_gps_rx_time = millis(); 
+    // passedChecksum(): yalnız geçerli NMEA cümleleri artar (gürültüyü saymaz).
+    if (tgps.passedChecksum() != last_gps_checksum) {
+        last_gps_checksum = tgps.passedChecksum();
+        last_gps_rx_time = millis();
     }
 
-    // TƏHLÜKƏSİZLİK HƏLLİ: Boot-dan sonra ilk 10 saniyə heç vaxt Swap etmə (GPS-in açılmasını gözlə)
-    if (millis() - system_boot_time > 10000) {
-        if (millis() - last_gps_rx_time > 4000) {
-            gps_is_swapped = !gps_is_swapped;
-            last_gps_rx_time = millis();
-            
-            #if defined(ARDUINO_TEENSY41)
-            if (gps_is_swapped) LPUART1_CTRL |= (1<<25); else LPUART1_CTRL &= ~(1<<25);
-            GPS_SERIAL.clear();
-            Serial.println(F("[GPS] XƏTA: Siqnal yoxdur! RX/TX Hard-Swap edildi (Teensy)."));
-            #endif
-        }
+    // Boot-dan sonra ilk 10 saniyə tespit yapma (GPS-in açılmasını gözlə).
+    if (millis() - system_boot_time > 10000 && millis() - last_gps_rx_time > 4000) {
+        last_gps_rx_time = millis(); // 4 sn'de bir tekrar uyar
+        ok.gps_fix = false;
+        Serial.println(F("[GPS] XƏTA: 4sn boyunca geçerli NMEA yok. RX/TX kablolarını kontrol edin!"));
     }
 }
 
 // ======================== RF PROTOKOL (Cüt CRC16) ========================
 #define RF_PKT_SYNC1        0xAA
 #define RF_PKT_SYNC2        0x55
-#define RF_PROTO_VERSION    0x01
-#define RF_DEVICE_ID        0xCC
 
 #define RF_PKT_TELEM        0x01
 #define RF_PKT_STATUS       0x02
@@ -515,9 +557,9 @@ void gps_auto_swap_update() {
 #define FLAG_AHT_OK         0x0004
 #define FLAG_GPS_FIX        0x0008
 #define FLAG_ARMED          0x0010
-#define FLAG_MOTORS_ON      0x0020
+#define FLAG_DESCENDING     0x0020
 #define FLAG_CAL_SAVED      0x0040
-#define FLAG_IMPACT         0x0080
+
 
 static uint16_t rf_seq = 0;
 static uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
@@ -568,15 +610,15 @@ static void rf_write_packet(uint8_t type, const uint8_t* payload, uint8_t len) {
 static void rf_send_binary_telemetry() {
     uint8_t p[96]; size_t i = 0;
     uint16_t flags = 0;
-    
-    if (ok.bno055) flags |= FLAG_BNO_OK; 
+
+    if (ok.bno055) flags |= FLAG_BNO_OK;
     if (ok.bme280) flags |= FLAG_BME_OK;
-    if (ok.aht20) flags |= FLAG_AHT_OK; 
+    if (ok.aht20) flags |= FLAG_AHT_OK;
     if (ok.gps_fix) flags |= FLAG_GPS_FIX;
-    if (rf_armed()) flags |= FLAG_ARMED; 
-    if (flight.state_code() == FS_DESCENDING) flags |= FLAG_MOTORS_ON;
+    if (rf_armed()) flags |= FLAG_ARMED;
+    if (flight.state_code() == FS_DESCENDING) flags |= FLAG_DESCENDING;
     if (bno_cal_saved) flags |= FLAG_CAL_SAVED;
-    
+
     put_u16(p, i, flags);
 
     if (ok.bno055) {
@@ -590,30 +632,32 @@ static void rf_send_binary_telemetry() {
         put_u16(p, i, f_u16(bme_h, 100.0f)); put_i32(p, i, f_i32(bme_a, 100.0f));
     } else { put_i16(p, i, 0); put_u16(p, i, 0); put_u16(p, i, 0); put_i32(p, i, 0); }
 
-    if (ok.aht20 && !isnan(aht_t)) { 
-        put_i16(p, i, f_i16(aht_t, 100.0f)); 
-        put_u16(p, i, f_u16(aht_h, 100.0f)); 
+    if (ok.aht20 && !isnan(aht_t)) {
+        put_i16(p, i, f_i16(aht_t, 100.0f));
+        put_u16(p, i, f_u16(aht_h, 100.0f));
     } else { put_i16(p, i, 0); put_u16(p, i, 0); }
 
-    int32_t lat_e7 = 0, lon_e7 = 0, gps_alt_cm = 0; 
-    uint16_t gps_speed_cm_s = 0, gps_course_x100 = 0; 
-    uint8_t gps_sats = 0;
-    
+    int32_t lat_e7 = 0, lon_e7 = 0, gps_alt_cm = 0;
+    uint16_t gps_speed_cm_s = 0, gps_course_x100 = 0, gps_hdop_x100 = 0;
+    uint8_t gps_sats = 0, gps_fix_quality = 0;
+
     if (ok.gps_fix || (gps.lat != 0.0 && gps.lon != 0.0)) {
         lat_e7 = (int32_t)(gps.lat * 10000000.0); lon_e7 = (int32_t)(gps.lon * 10000000.0);
         gps_alt_cm = f_i32(gps.altitude, 100.0f); gps_speed_cm_s = f_u16(gps.speed, 100.0f);
         gps_course_x100 = f_u16(gps.course, 100.0f); gps_sats = gps.satellites;
+        gps_fix_quality = gps.fix_quality; gps_hdop_x100 = f_u16(gps.hdop, 100.0f);
     }
-    
+
     put_i32(p, i, lat_e7); put_i32(p, i, lon_e7); put_i32(p, i, gps_alt_cm);
     put_u16(p, i, gps_speed_cm_s); put_u16(p, i, gps_course_x100); put_u8(p, i, gps_sats);
+    put_u8(p, i, gps_fix_quality); put_u16(p, i, gps_hdop_x100);
 
     put_i16(p, i, f_i16(mad_roll, 100.0f)); put_i16(p, i, f_i16(mad_pitch, 100.0f)); put_i16(p, i, f_i16(mad_yaw, 100.0f));
     put_i32(p, i, f_i32(altvel.rel_alt, 100.0f)); put_i16(p, i, f_i16(altvel.vel, 100.0f));
     put_u16(p, i, f_u16(altvel.g_force, 1000.0f)); put_i16(p, i, f_i16(altvel.dpdt, 1000.0f));
 
-    put_u8(p, i, rf_armed() ? 1 : 0); 
-    put_u8(p, i, flight.state_code()); 
+    put_u8(p, i, rf_armed() ? 1 : 0);
+    put_u8(p, i, flight.state_code());
     put_u16(p, i, (uint16_t)_current_esc1_us);
 
     rf_write_packet(RF_PKT_TELEM, p, i);
@@ -622,42 +666,24 @@ static void rf_send_binary_telemetry() {
 // ======================== SETUP ========================
 void setup(){
     system_boot_time = millis(); // Boot vaxtını yadda saxlayır
-    
-    pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,HIGH);
-    esc_init(); Serial.begin(115200); delay(2000);
 
-    if(ESC_CALIBRATE_US) { 
-       Serial.println(F("\n!!! ESC KALİBRASİYA REJİMİ AKTİVDİR !!!"));
-        Serial.println(F("Batareyanı İNDİ QOŞUN! ESC-lərə Max Throttle (2000us) göndərilir..."));
-        esc_write_us(2000, 2000);
-        
-        // Batareyanı qoşub Biip səslərini eşitmək üçün 6 saniyə vaxt verir
-        delay(6000); 
-        
-        Serial.println(F("Min Throttle (1000us) göndərilir. ARM səsi gözləyin..."));
-        esc_write_us(1000, 1000);
-        delay(4000);
-        
-        Serial.println(F("KALİBRASİYA BİTDİ! Lütfən kodda CALIBRATE_ESC-i 0 edib Teensy-ə yenidən yükləyin."));
-        while(1); // Proqramı burada kilidlə (uçuşa keçməsin)
-    
-    
-    }
-    
+    pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,HIGH);
+    esc_init(); Serial.begin(115200); delay(200);
+
     Serial.println(F("\n=== TEENSY 4.1 " DEVICE_NAME " ==="));
     Serial.println(F("[MOTOR MƏNTİQİ] Düşüş zamanı ESC1 xətti artır -> 1 saniyə sonra ESC2 artır"));
     Serial.println(F("[SON KƏSİM] Yerdən 1m hündürlükdə (və ya ağacın üstündə) motorlar birdəfəlik susur"));
 
     altvel.init(); flight.init();
-    
+
     Serial2.addMemoryForWrite(serial2_tx_buf, sizeof(serial2_tx_buf));
     Serial2.addMemoryForRead(serial2_rx_buf, sizeof(serial2_rx_buf));
-    RF_SERIAL.begin(RF_BAUD); Wire.begin(); Wire.setClock(I2C_FREQ);
+    RF_SERIAL.begin(RF_BAUD); Wire.begin(); Wire.setClock(I2C_FREQ); Wire.setTimeout(2);
 
-    if(!bno.begin()) { ok.bno055 = false; } 
+    if(!bno.begin(OPERATION_MODE_IMUPLUS)) { ok.bno055 = false; }
     else { ok.bno055 = true; bno.setExtCrystalUse(false); bno_load_calibration(); delay(50); }
 
-    if (!bme.begin(0x76, &Wire)) { ok.bme280 = false; } 
+    if (!bme.begin(0x76, &Wire)) { ok.bme280 = false; }
     else {
         ok.bme280 = true;
         bme.setSampling(Adafruit_BME280::MODE_NORMAL, Adafruit_BME280::SAMPLING_X2, Adafruit_BME280::SAMPLING_X16,
@@ -666,11 +692,13 @@ void setup(){
     }
     if (!aht.begin()) { ok.aht20 = false; } else { ok.aht20 = true; }
 
+    GPS_SERIAL.addMemoryForWrite(serial6_tx_buf, sizeof(serial6_tx_buf));
+    GPS_SERIAL.addMemoryForRead(serial6_rx_buf, sizeof(serial6_rx_buf));
     GPS_SERIAL.begin(GPS_BAUD);
     ekf.init(0.0f, 0.0f, 9.80665f);
 
     uint32_t now=millis();
-    lastBno=lastBme=lastAht=lastGps=lastPrn=lastRf=lastGpsDbg=lastMag=lastFlight=last_gps_rx_time=now;
+    lastBno=lastBme=lastAht=lastGps=lastPrn=lastRf=lastMag=lastFlight=last_gps_rx_time=now;
     digitalWrite(LED_PIN,LOW);
 }
 
@@ -689,12 +717,12 @@ void loop(){
     if(now-lastFlight>=FLIGHT_PERIOD){
         float dt_flt = (now - lastFlight) * 1.0e-3f;
         lastFlight=now;
-        
+
         float tilt = fmaxf(fabsf(mad_roll), fabsf(mad_pitch));
         uint8_t old_state = flight.state_code();
-        
+
         flight.update(altvel.rel_alt, altvel.vel, tilt, dt_flt, now);
-        
+
         if (old_state != flight.state_code()) {
             uint8_t p[2] = {(uint8_t)(_armed?1:0), flight.state_code()};
             rf_write_packet(RF_PKT_STATUS, p, 2);
@@ -769,16 +797,19 @@ void loop(){
         lastGps = now;
         bool fresh = (tgps.location.age() < GPS_AGE_MAX_MS);
         if (tgps.location.isValid() && fresh) {
-            gps.lat = tgps.location.lat(); 
+            gps.lat = tgps.location.lat();
             gps.lon = tgps.location.lng();
             gps.fix = 1;
+            if (tgps.altitude.isValid()) { gps.altitude = (float)tgps.altitude.meters(); gps_alt_valid = true; }
+            if (tgps.speed.isValid())    gps.speed    = (float)tgps.speed.mps();
+            if (tgps.course.isValid())   gps.course   = (float)tgps.course.deg();
+            gps.satellites = (uint8_t)tgps.satellites.value();
+            gps.fix_quality = (uint8_t)(tgps.location.FixQuality() - '0');
+            if (tgps.hdop.isValid())     gps.hdop     = (float)tgps.hdop.hdop();
         } else { gps.fix = 0; }
 
-        if (tgps.altitude.isValid()) gps.altitude = (float)tgps.altitude.meters();
-        if (tgps.speed.isValid()) gps.speed = (float)tgps.speed.mps();
-        if (tgps.course.isValid()) gps.course = (float)tgps.course.deg();
-        gps.satellites = (uint8_t)tgps.satellites.value();
         ok.gps_fix = (gps.fix > 0);
+        if (!ok.bme280 && gps_alt_valid && gps.fix) altvel.updateFromGPS(gps.altitude, now);
     }
 
     // --- BNO Kalibrasiya EEPROM yazımı (1 Hz) ---
@@ -797,7 +828,7 @@ void loop(){
         Serial.print(now); Serial.print(F(" | ST:")); Serial.print((int)flight.state_code());
         Serial.print(F(" | Z:")); Serial.print(altvel.rel_alt, 1);
         Serial.print(F("m Vz:")); Serial.print(altvel.vel, 1);
-        Serial.print(F("m/s | E1:")); Serial.print(_current_esc1_us, 0); 
+        Serial.print(F("m/s | E1:")); Serial.print(_current_esc1_us, 0);
         Serial.print(F(" E2:")); Serial.print(_current_esc2_us, 0); Serial.println(F("us"));
     }
 
