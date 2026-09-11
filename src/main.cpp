@@ -105,6 +105,7 @@ void esc_write_us(float us1, float us2) {
 static uint16_t crc16_ccitt(const uint8_t* data, size_t len); 
 static uint8_t rf_cmd_state = 0, rf_cmd_buf[5], rf_cmd_idx = 0;
 static bool _force_launch_cmd = false;
+static uint8_t _rf_tx_seq = 0;
 
 void rf_command_update() {
     uint8_t reads = 0;
@@ -387,7 +388,6 @@ struct FlightCtrl {
             if (vel < -1.0f && (max_alt - rel_alt > 2.0f)) state = FS_DESCENDING;
         }
         else if (state == FS_DESCENDING) {
-            // YENİ: fast_g_val zərbə filtri kimi daha həssasdır (> 4.0G)
             if (rel_alt <= 1.0f || fast_g_val > 4.0f) { state = FS_LANDED; landing_steady_start = 0; }
             else if (fabsf(vel) < 0.3f) {
                 if (landing_steady_start == 0) landing_steady_start = now;
@@ -448,8 +448,9 @@ void setup(){
     uint32_t now=millis(); lastBno=lastBme=lastAht=lastGps=lastPrn=lastRf=lastMag=lastFlight=now; 
     digitalWrite(LED_PIN,LOW);
 
-    // YENİ: Watchdog yalnız bütün sensorlar və kalibrasiyalar bitdikdən sonra başladılır.
-    wdt.begin(WDT_Config(WDT_1024MS)); 
+    WDT_timings_t wdt_config;
+    wdt_config.timeout = 1.024f; /* ~1024 ms timeout (WDT1 çözünürlüğü 0.5 sn) */
+    wdt.begin(wdt_config); 
 }
 
 void loop(){
@@ -497,7 +498,6 @@ void loop(){
         }
     }
 
-    // YENİ: AHT20 Loop daxilinə geri qaytarıldı
     if (ok.aht20 && now - lastAht >= AHT20_PERIOD) {
         lastAht = now;
         sensors_event_t humidity, temp; aht.getEvent(&humidity, &temp);
@@ -508,6 +508,8 @@ void loop(){
         lastGps = now; bool fresh = (tgps.location.age() < GPS_AGE_MAX_MS);
         if (tgps.location.isValid() && fresh) {
             gps.lat = tgps.location.lat(); gps.lon = tgps.location.lng(); gps.fix = 1;
+            gps.satellites = tgps.satellites.value();
+            gps.hdop = (float)tgps.hdop.hdop();
             if (tgps.altitude.isValid()) { gps.altitude = (float)tgps.altitude.meters(); gps_alt_valid = true; }
             if (tgps.speed.isValid()) gps.speed = (float)tgps.speed.mps();
             if (tgps.course.isValid()) gps.course = (float)tgps.course.deg();
@@ -524,7 +526,6 @@ void loop(){
         } else cal_good_start_ms = 0;
     }
 
-    // YENİ: Telemetry və LED Update Loop daxilinə geri qaytarıldı
     if (now - lastRf >= RF_PERIOD) {
         lastRf = now;
         rf_send_binary_telemetry();
@@ -532,6 +533,155 @@ void loop(){
     led_show_state(flight.state_code());
 }
 
-static uint16_t crc16_ccitt(const uint8_t* data, size_t len) { uint16_t crc = 0xFFFF; for (size_t i = 0; i < len; i++) { crc ^= (uint16_t)data[i] << 8; for (uint8_t bit = 0; bit < 8; bit++) { crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1); } } return crc; }
+static uint16_t crc16_ccitt(const uint8_t* data, size_t len) { 
+    uint16_t crc = 0xFFFF; 
+    for (size_t i = 0; i < len; i++) { 
+        crc ^= (uint16_t)data[i] << 8; 
+        for (uint8_t bit = 0; bit < 8; bit++) { 
+            crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1); 
+        } 
+    } 
+    return crc; 
+}
 
-// Qeyd: rf_send_binary_telemetry() və led_show_state() funksiyalarının gövdəsini V1/V2-də olduğu kimi saxlayın, dəyişməyə ehtiyac yoxdur.
+// =============================================================================
+// RF BİNARY TELEMETRY PAKETİ - SƏNAYE FORMATI
+// =============================================================================
+// Paket uzunluğu: 40 bytes (CRC daxil)
+// | Offset | Size | Məzmun                       |
+// |--------|------|------------------------------|
+// | 0      | 2    | Sync (0xAA, 0x55)            |
+// | 2      | 1    | Protocol Version (0x01)      |
+// | 3      | 1    | Device ID (0xCC)             |
+// | 4      | 1    | Sequence Number              |
+// | 5      | 1    | Flight State                 |
+// | 6      | 1    | Sensor Status Flags          |
+// | 7      | 2    | Roll (int16, 0.01 deg)       |
+// | 9      | 2    | Pitch (int16, 0.01 deg)      |
+// | 11     | 2    | Yaw (int16, 0.01 deg)        |
+// | 13     | 4    | Rel Alt (int32, mm)          |
+// | 17     | 2    | Velocity (int16, cm/s)       |
+// | 19     | 4    | GPS Lat (int32, 1e-7 deg)    |
+// | 23     | 4    | GPS Lon (int32, 1e-7 deg)    |
+// | 27     | 2    | GPS Alt (int16, 0.1 m)       |
+// | 29     | 2    | GPS Speed (int16, 0.1 m/s)   |
+// | 31     | 2    | GPS Course (int16, 0.01 deg) |
+// | 33     | 1    | GPS Satellites               |
+// | 34     | 2    | G-force (int16, 0.01 G)      |
+// | 36     | 2    | BME Pressure (uint16, 0.1 hPa)|
+// | 38     | 2    | CRC16-CCITT (little-endian)  |
+// =============================================================================
+
+static void rf_send_binary_telemetry() {
+    uint8_t pkt[40];
+    uint8_t idx = 0;
+    
+    // Header
+    pkt[idx++] = RF_CMD_SYNC1;
+    pkt[idx++] = RF_CMD_SYNC2;
+    pkt[idx++] = RF_PROTO_VERSION;
+    pkt[idx++] = RF_DEVICE_ID;
+    pkt[idx++] = ++_rf_tx_seq;
+    pkt[idx++] = flight.state_code();
+    
+    // Sensor status: bit0=GPS fix, bit1=AHT20, bit2=BME280, bit3=BNO055, bit4=armed
+    uint8_t status = (ok.gps_fix << 0) | (ok.aht20 << 1) | (ok.bme280 << 2) | (ok.bno055 << 3) | (_armed ? 0x10 : 0);
+    pkt[idx++] = status;
+    
+    // Attitude (deg * 100)
+    int16_t roll_i  = (int16_t)fmaxf(fminf(mad_roll  * 100.0f,  18000), -18000);
+    int16_t pitch_i = (int16_t)fmaxf(fminf(mad_pitch * 100.0f,   9000),  -9000);
+    int16_t yaw_i   = (int16_t)fmaxf(fminf(mad_yaw   * 100.0f,  18000), -18000);
+    memcpy(&pkt[idx], &roll_i,  2); idx += 2;
+    memcpy(&pkt[idx], &pitch_i, 2); idx += 2;
+    memcpy(&pkt[idx], &yaw_i,   2); idx += 2;
+    
+    // Altitude (mm) və Velocity (cm/s)
+    int32_t alt_mm = (int32_t)fmaxf(fminf(altvel.rel_alt * 1000.0f,  5000000), -5000000);
+    int16_t vel_cms = (int16_t)fmaxf(fminf(altvel.vel * 100.0f,  32000), -32000);
+    memcpy(&pkt[idx], &alt_mm, 4); idx += 4;
+    memcpy(&pkt[idx], &vel_cms, 2); idx += 2;
+    
+    // GPS (lat, lon 1e-7 deg formatında)
+    int32_t lat_i7 = (int32_t)(gps.lat * 1e7);
+    int32_t lon_i7 = (int32_t)(gps.lon * 1e7);
+    memcpy(&pkt[idx], &lat_i7, 4); idx += 4;
+    memcpy(&pkt[idx], &lon_i7, 4); idx += 4;
+    
+    // GPS Alt, Speed, Course
+    int16_t gps_alt_01m = (int16_t)fmaxf(fminf(gps.altitude * 10.0f,  32000), -1000);
+    int16_t gps_spd_01ms = (int16_t)fmaxf(fminf(gps.speed * 10.0f,  32000), 0);
+    int16_t gps_crs_01d = (int16_t)fmaxf(fminf(gps.course * 100.0f,  36000), 0);
+    memcpy(&pkt[idx], &gps_alt_01m, 2); idx += 2;
+    memcpy(&pkt[idx], &gps_spd_01ms, 2); idx += 2;
+    memcpy(&pkt[idx], &gps_crs_01d, 2); idx += 2;
+    
+    // GPS satellites
+    pkt[idx++] = gps.satellites;
+    
+    // G-force (0.01 G)
+    int16_t g_01 = (int16_t)fmaxf(fminf(fast_g * 100.0f,  32000), 0);
+    memcpy(&pkt[idx], &g_01, 2); idx += 2;
+    
+    // BME Pressure (0.1 hPa)
+    uint16_t pres_01 = (uint16_t)fmaxf(fminf(bme_p * 10.0f,  65535), 0);
+    memcpy(&pkt[idx], &pres_01, 2); idx += 2;
+    
+    // CRC16 hesabla və əlavə et (little-endian)
+    uint16_t crc = crc16_ccitt(pkt, idx);
+    pkt[idx++] = (uint8_t)(crc & 0xFF);
+    pkt[idx++] = (uint8_t)((crc >> 8) & 0xFF);
+    
+    RF_SERIAL.write(pkt, idx);
+}
+
+// =============================================================================
+// LED VƏZİYYƏT GÖSTƏRİCİSİ
+// =============================================================================
+// FS_STANDBY    : 1 Hz yavaş yanıb-sönmə (sistem hazırdır, gözləyir)
+// FS_LAUNCHED   : 8 Hz sürətli yanıb-sönmə (aktiv uçuş)
+// FS_DESCENDING : 2 Hz orta yanıb-sönmə (paraşüt və ya eniş)
+// FS_LANDED     : Sabit yanır 3 saniyə, sonra sönür (uçuş tamamlandı)
+// =============================================================================
+
+static void led_show_state(uint8_t st) {
+    static uint32_t landed_off_time = 0;
+    uint32_t t = millis();
+    
+    switch (st) {
+        case FS_STANDBY:
+            // 1 Hz (500ms ON, 500ms OFF)
+            digitalWrite(LED_PIN, (t / 500) % 2);
+            landed_off_time = 0;
+            break;
+            
+        case FS_LAUNCHED:
+            // 8 Hz (62.5ms ON, 62.5ms OFF) - aktiv uçuş göstəricisi
+            digitalWrite(LED_PIN, (t / 62) % 2);
+            landed_off_time = 0;
+            break;
+            
+        case FS_DESCENDING:
+            // 2 Hz (250ms ON, 250ms OFF)
+            digitalWrite(LED_PIN, (t / 250) % 2);
+            landed_off_time = 0;
+            break;
+            
+        case FS_LANDED:
+            // 3 saniyə sabit yan, sonra sön
+            if (landed_off_time == 0) {
+                landed_off_time = t + 3000UL;
+                digitalWrite(LED_PIN, HIGH);
+            } else if (t < landed_off_time) {
+                digitalWrite(LED_PIN, HIGH);
+            } else {
+                digitalWrite(LED_PIN, LOW);
+            }
+            break;
+            
+        default:
+            digitalWrite(LED_PIN, LOW);
+            landed_off_time = 0;
+            break;
+    }
+}
